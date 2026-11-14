@@ -1,0 +1,15 @@
+{
+  "name": "discord-rpcheck-audit-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Discord roleplay activity checks with searchable staff audit logs",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "check": "node --check bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.28.1",
+    "dotenv": "^16.6.1"
+  }
+}
