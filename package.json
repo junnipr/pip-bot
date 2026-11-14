@@ -1,8 +1,8 @@
 {
-  "name": "discord-rpcheck-audit-bot",
-  "version": "1.0.0",
+  "name": "pip-rpcheck-bot",
+  "version": "1.4.0",
   "private": true,
-  "description": "Discord roleplay activity checks with searchable staff audit logs",
+  "description": "Pip RP audit bot with slash commands, /cmd interactive embed menu, forum/thread scans, and Railway Volume configuration",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
@@ -11,5 +11,8 @@
   "dependencies": {
     "discord.js": "^14.28.1",
     "dotenv": "^16.6.1"
+  },
+  "engines": {
+    "node": ">=24.17.0"
   }
 }
