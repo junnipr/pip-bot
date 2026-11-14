@@ -1,7 +1,7 @@
 /**
  * RP Check Bot - discord.js 14
  * Members type !rpcheck in the configured check channel.
- * The bot audits recent messages in configured RP channels, sends a staff log,
+ * The bot audits recent messages in configured RP text, thread, and forum channels, sends a staff log,
  * and reacts ✅ once the report has been sent.
  */
 require('dotenv').config();
@@ -21,7 +21,9 @@ const STAFF_ROLE_IDS = new Set(
   (process.env.STAFF_ROLE_IDS || '').split(',').map(x => x.trim()).filter(Boolean)
 );
 const CONFIG_PATH = path.join(__dirname, 'rpcheck-config.json');
-const MAX_PAGES_PER_CHANNEL = 50; // up to 5,000 recent messages/channel/check
+const MAX_PAGES_PER_CHANNEL = 50; // 5,000 recent messages per text channel or forum post
+const MAX_THREADS_PER_PARENT = 300;
+const MAX_ARCHIVED_THREAD_PAGES = 5;
 
 if (!TOKEN) {
   console.error('Missing DISCORD_TOKEN in .env');
@@ -64,13 +66,18 @@ function isStaff(message) {
     [...STAFF_ROLE_IDS].some(id => message.member.roles.cache.has(id));
 }
 
-function parseChannel(message, input) {
+async function parseChannel(message, input) {
   const id = input?.match(/^<#(\d+)>$|^(\d+)$/)?.slice(1).find(Boolean);
-  return id ? message.guild.channels.cache.get(id) : null;
+  return id ? message.guild.channels.fetch(id).catch(() => null) : null;
 }
 
 function isSupportedChannel(channel) {
   return channel && [ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(channel.type);
+}
+
+function isSupportedMonitorChannel(channel) {
+  return isSupportedChannel(channel) || channel?.type === ChannelType.GuildForum ||
+    [ChannelType.PublicThread, ChannelType.AnnouncementThread, ChannelType.PrivateThread].includes(channel?.type);
 }
 
 async function reply(message, content) {
@@ -108,6 +115,80 @@ async function scanChannel(channel, userId, cutoff) {
   return { matches, truncated };
 }
 
+// Public posts in forums are threads. Regular text channels also have threads.
+// We scan PUBLIC threads automatically under a configured parent channel.
+// A private thread is scanned only if explicitly configured by ID and readable by Pip.
+async function collectPublicThreads(parent, cutoff) {
+  const threads = new Map();
+  const warnings = [];
+  try {
+    const active = await parent.threads.fetchActive(false);
+    for (const thread of active.threads.values()) {
+      if (thread.type === ChannelType.PrivateThread) continue;
+      if (threads.size >= MAX_THREADS_PER_PARENT) {
+        warnings.push(`#${parent.name}: reached ${MAX_THREADS_PER_PARENT}-thread cap`);
+        break;
+      }
+      threads.set(thread.id, thread);
+    }
+  } catch (error) {
+    console.error(`Cannot list active threads in ${parent.name}:`, error);
+    warnings.push(`#${parent.name}: could not list active threads`);
+  }
+
+  let before;
+  if (threads.size < MAX_THREADS_PER_PARENT) {
+    try {
+      for (let page = 0; page < MAX_ARCHIVED_THREAD_PAGES; page++) {
+        const opts = { type: 'public', limit: 100 };
+        if (before) opts.before = before;
+        const result = await parent.threads.fetchArchived(opts, false);
+        const archived = [...result.threads.values()];
+        if (!archived.length) break;
+        let earliest = Infinity;
+        for (const thread of archived) {
+          const stamp = thread.archiveTimestamp ?? thread.createdTimestamp ?? Date.now();
+          earliest = Math.min(earliest, stamp);
+          if (stamp < cutoff || threads.has(thread.id)) continue;
+          if (threads.size >= MAX_THREADS_PER_PARENT) {
+            warnings.push(`#${parent.name}: reached ${MAX_THREADS_PER_PARENT}-thread cap`);
+            break;
+          }
+          threads.set(thread.id, thread);
+        }
+        if (threads.size >= MAX_THREADS_PER_PARENT || !result.hasMore || earliest < cutoff) break;
+        if (page === MAX_ARCHIVED_THREAD_PAGES - 1) {
+          warnings.push(`#${parent.name}: reached archived-thread pagination cap`);
+          break;
+        }
+        before = new Date(earliest - 1);
+      }
+    } catch (error) {
+      console.error(`Cannot list archived threads in ${parent.name}:`, error);
+      warnings.push(`#${parent.name}: could not list archived public threads`);
+    }
+  }
+  return { threads: [...threads.values()], warnings };
+}
+
+async function scanChildThreads(parent, userId, cutoff) {
+  const { threads, warnings } = await collectPublicThreads(parent, cutoff);
+  const matches = [];
+  let searchedThreads = 0;
+  for (const thread of threads) {
+    try {
+      const result = await scanChannel(thread, userId, cutoff);
+      searchedThreads++;
+      matches.push(...result.matches);
+      if (result.truncated) warnings.push(`#${parent.name} / ${thread.name}: reached 5,000-message cap`);
+    } catch (error) {
+      console.error(`Cannot read thread ${thread.id}:`, error);
+      warnings.push(`#${parent.name} / ${thread.name}: could not read messages`);
+    }
+  }
+  return { matches, warnings, searchedThreads };
+}
+
 function cleanContent(message) {
   let text = message.content.replace(/\s+/g, ' ').trim();
   if (!text) {
@@ -130,28 +211,44 @@ async function runAudit(originMessage, targetUser) {
   }
 
   const cutoff = Date.now() - cfg.hours * 60 * 60 * 1000;
-  const found = [];
+  const foundById = new Map(); // avoid double-counting a thread also added separately
   const summaries = [];
   const warnings = [];
 
   for (const channelId of cfg.rpChannels) {
     const channel = await originMessage.guild.channels.fetch(channelId).catch(() => null);
-    if (!isSupportedChannel(channel)) {
+    if (!isSupportedMonitorChannel(channel)) {
       warnings.push(`#${channelId}: missing or unsupported`);
       continue;
     }
     try {
-      const { matches, truncated } = await scanChannel(channel, targetUser.id, cutoff);
-      summaries.push(`${channel.name}: ${matches.length}`);
-      found.push(...matches);
-      if (truncated) warnings.push(`#${channel.name}: reached 5,000-message scan cap`);
+      if (channel.type === ChannelType.GuildForum) {
+        const { matches, warnings: threadWarnings, searchedThreads } =
+          await scanChildThreads(channel, targetUser.id, cutoff);
+        summaries.push(`${channel.name} (forum, ${searchedThreads} posts): ${matches.length}`);
+        for (const m of matches) foundById.set(m.id, m);
+        warnings.push(...threadWarnings);
+      } else if (channel.isThread()) {
+        const { matches, truncated } = await scanChannel(channel, targetUser.id, cutoff);
+        summaries.push(`${channel.parent?.name || 'thread'} / ${channel.name}: ${matches.length}`);
+        for (const m of matches) foundById.set(m.id, m);
+        if (truncated) warnings.push(`#${channel.name}: reached 5,000-message cap`);
+      } else {
+        const { matches: parentMatches, truncated } = await scanChannel(channel, targetUser.id, cutoff);
+        const { matches: threadMatches, warnings: threadWarnings, searchedThreads } =
+          await scanChildThreads(channel, targetUser.id, cutoff);
+        summaries.push(`${channel.name} (+ ${searchedThreads} public threads): ${parentMatches.length + threadMatches.length}`);
+        for (const m of [...parentMatches, ...threadMatches]) foundById.set(m.id, m);
+        if (truncated) warnings.push(`#${channel.name}: reached 5,000-message cap`);
+        warnings.push(...threadWarnings);
+      }
     } catch (error) {
       console.error(`Cannot audit channel ${channelId}:`, error);
       warnings.push(`#${channel.name}: could not read message history`);
     }
   }
 
-  found.sort((a, b) => b.createdTimestamp - a.createdTimestamp);
+  const found = [...foundById.values()].sort((a, b) => b.createdTimestamp - a.createdTimestamp);
 
   // Put the user's name AND permanent ID in EVERY log message, so staff can
   // search the staff-log channel for that ID in Discord's Ctrl+F search.
@@ -169,7 +266,9 @@ async function runAudit(originMessage, targetUser) {
   // Every line includes an exact original-message link; copied content is only
   // a preview. No Discord mentions are allowed in posted audit messages.
   const lines = found.map(m =>
-    `#${m.channel.name} | <t:${Math.floor(m.createdTimestamp / 1000)}:f> | ${cleanContent(m)}\n${m.url}`
+    `${m.channel.isThread()
+      ? `#${m.channel.parent?.name || "unknown-parent"} / ${m.channel.name}`
+      : `#${m.channel.name}`} | <t:${Math.floor(m.createdTimestamp / 1000)}:f> | ${cleanContent(m)}\n${m.url}`
   );
 
   const pages = [];
@@ -262,9 +361,12 @@ client.on(Events.MessageCreate, async message => {
       return reply(message, `RP audit window set to ${hours} hours.`);
     }
 
-    const channel = parseChannel(message, args[0]);
-    if (!isSupportedChannel(channel)) {
-      return reply(message, `Usage: \`${command} #text-channel\` (mention a regular server text channel).`);
+    const channel = await parseChannel(message, args[0]);
+    const supportsThisCommand = (command === '!rpadd' || command === '!rpremove')
+      ? isSupportedMonitorChannel(channel)
+      : isSupportedChannel(channel);
+    if (!supportsThisCommand) {
+      return reply(message, `Usage: \`${command} #channel\` (monitoring accepts text, forum, or specific thread IDs; check and log channels must be text channels).`);
     }
 
     if (command === '!rpadd') {
