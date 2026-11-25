@@ -1,8 +1,27 @@
+
+// =========================================================================
+// 01 — ENVIRONMENT, BOT CLIENT, AND TUNABLE LIMITS
+// =========================================================================
 /**
- * Pip v1.6.1 - discord.js 14
- * Members use !rpcheck or /rpcheck in the configured check channel. All other commands use /.
- * The bot audits recent messages in configured RP text, thread, and forum channels, sends a staff log,
- * and reacts ✅ once the report has been sent.
+ * Pip v1.8 — organized edition (compatible with Pip v1.7 settings).
+ *
+ * Entrypoint: bot.js (single-file, drop-in replacement for GitHub/Railway).
+ * Member commands: !rpcheck and /rpcheck. All other prefix commands are disabled.
+ * Staff commands: slash commands. Keeps Tupperbox attribution, charts, forum/threads,
+ * webhook mirroring, message links, and persistent /data storage behavior.
+ *
+ * Sections (ordered by responsibility):
+ *  01. Environment and Discord client
+ *  02. General utilities and concurrency helpers
+ *  03. Persistent settings and chart storage
+ *  04. Permissions and interaction responses
+ *  05. Channel validation and Tupperbox attribution
+ *  06. RP scanning and Discord message utilities
+ *  07. Chart collection and rendering
+ *  08. Audit report formatting and delivery
+ *  09. Audit job queue and background dashboard updates
+ *  10. Slash commands and help embeds
+ *  11. Discord events and startup
  */
 require('dotenv').config();
 
@@ -37,6 +56,17 @@ const LEGACY_CONFIG_PATH = path.join(__dirname, 'rpcheck-config.json');
 const MAX_PAGES_PER_CHANNEL = 50; // 5,000 recent messages per text channel or forum post
 const MAX_THREADS_PER_PARENT = 300;
 const MAX_ARCHIVED_THREAD_PAGES = 5;
+// Keep concurrency bounded: Discord enforces per-route and global API limits.
+const MAX_CONCURRENT_SOURCES = 2;
+const MAX_CONCURRENT_THREADS = 3;
+const MAX_CONCURRENT_AUDITS = 2;
+const SCAN_CACHE_MS = 45_000;
+const TUPPER_CACHE_MS = 90_000;
+const MAX_SCAN_CACHE_ENTRIES = 800;
+const channelScanCache = new Map();
+const tupperOwnerCache = new Map();
+
+
 const TUPPERBOX_BOT_ID = process.env.PIP_TUPPERBOX_BOT_ID || '431544605209788416';
 const AUDIT_WEBHOOK_URL = process.env.PIP_AUDIT_WEBHOOK_URL || '';
 // Must specify a single guild to prevent leaking audits from other servers.
@@ -62,130 +92,36 @@ const client = new Client({
   ],
 });
 
-// Slash commands are registered to each server after Pip connects. Guild commands
-// normally appear immediately in Discord's / command picker (no portal form needed).
-const SLASH_COMMANDS = [
-  new SlashCommandBuilder().setName('rpcheck').setDescription('Submit your own RP activity check.'),
-  new SlashCommandBuilder().setName('rplog').setDescription('Staff: audit a member’s recent RP messages.')
-    .addUserOption(o => o.setName('member').setDescription('Member to audit').setRequired(true)),
-  new SlashCommandBuilder().setName('rpadd').setDescription('Admin: monitor an RP channel, forum, or thread.')
-    .addChannelOption(o => o.setName('channel').setDescription('RP channel or forum (including its public threads)').setRequired(false))
-    .addStringOption(o => o.setName('thread_id').setDescription('Optional: exact thread ID instead of a channel').setRequired(false)),
-  new SlashCommandBuilder().setName('rpremove').setDescription('Admin: stop monitoring an RP channel, forum, or thread.')
-    .addChannelOption(o => o.setName('channel').setDescription('Previously monitored channel or forum').setRequired(false))
-    .addStringOption(o => o.setName('thread_id').setDescription('Optional: exact thread ID instead of a channel').setRequired(false)),
-  new SlashCommandBuilder().setName('rplist').setDescription('Staff: view Pip’s monitored sources and settings.'),
-  new SlashCommandBuilder().setName('rphours').setDescription('Admin: set the RP audit lookback period.')
-    .addIntegerOption(o => o.setName('hours').setDescription('1 to 336 hours; 168 = one week').setMinValue(1).setMaxValue(336).setRequired(true)),
-  new SlashCommandBuilder().setName('rplogchannel').setDescription('Admin: set the private staff audit log channel.')
-    .addChannelOption(o => o.setName('channel').setDescription('Staff-only text channel').setRequired(true)),
-  new SlashCommandBuilder().setName('rpcheckchannel').setDescription('Admin: choose where members submit RP checks.')
-    .addChannelOption(o => o.setName('channel').setDescription('Check-in text channel').setRequired(true)),
-  new SlashCommandBuilder().setName('rphealth').setDescription('Staff: verify Pip’s settings storage on Railway.'),
-  new SlashCommandBuilder().setName('tupperlogchannel').setDescription('Admin: set the private Tupperbox proxy-ownership log channel.')
-    .addChannelOption(o => o.setName('channel').setDescription('Channel used by Tupperbox official proxy logs').setRequired(true)),
-  new SlashCommandBuilder().setName('tupperdiagnose').setDescription('Staff: check whether Pip can read and attribute Tupperbox logs.'),
-  new SlashCommandBuilder().setName('cmd').setDescription('Open Pip’s interactive command directory.')
-    .addSubcommand(o => o.setName('list').setDescription('View the complete command directory.'))
-    .addSubcommand(o => o.setName('info').setDescription('Learn about Pip and its audit reports.'))
-    .addSubcommand(o => o.setName('setup').setDescription('Read the server setup guide.')),
-  new SlashCommandBuilder().setName('rpchart').setDescription('Staff: view and update the RP check-in and activity chart.')
-    .addSubcommand(o => o.setName('view').setDescription('View the RP activity and check-in chart.')
-      .addIntegerOption(p => p.setName('page').setDescription('Chart page (15 members per page)').setMinValue(1).setRequired(false)))
-    .addSubcommand(o => o.setName('refresh').setDescription('Scan monitored RP sources and refresh the chart.'))
-    .addSubcommand(o => o.setName('post').setDescription('Post or update the chart in the private staff log.'))
-    .addSubcommand(o => o.setName('track').setDescription('Include a member on the chart even if they have no activity.')
-      .addUserOption(p => p.setName('member').setDescription('Server member to track').setRequired(true)))
-    .addSubcommand(o => o.setName('untrack').setDescription('Stop manually tracking a member on the chart.')
-      .addUserOption(p => p.setName('member').setDescription('Member to stop tracking').setRequired(true))),
-  new SlashCommandBuilder().setName('ping').setDescription('Check whether Pip is online and responsive.'),
-];
 
-async function registerGuildCommands(guild) {
-  try {
-    // Replace only Pip’s guild-level command list. This does not change bot files,
-    // configuration, permissions, token, or posted audit reports.
-    await guild.commands.set(SLASH_COMMANDS.map(command => command.toJSON()));
-    console.log(`Published ${SLASH_COMMANDS.length} slash-command groups to ${guild.name} (${guild.id})`);
-  } catch (error) {
-    console.error(`Failed publishing slash commands in ${guild.id}:`, error);
+// =========================================================================
+// 02 — GENERAL UTILITIES, CACHES, AND BOUNDED CONCURRENCY
+// =========================================================================
+async function mapWithConcurrency(items, concurrency, worker) {
+  let cursor = 0;
+  await Promise.all(Array.from({ length: Math.min(items.length, concurrency) }, async () => {
+    while (cursor < items.length) {
+      const item = items[cursor++];
+      await worker(item);
+    }
+  }));
+}
+
+function snowflakeTimestamp(id) {
+  if (!/^\d{17,22}$/.test(String(id || ''))) return null;
+  try { return Number((BigInt(id) >> 22n) + 1420070400000n); }
+  catch { return null; }
+}
+
+function invalidateChannelCache(channelId) {
+  for (const key of channelScanCache.keys()) {
+    if (key.startsWith(`${channelId}:`)) channelScanCache.delete(key);
   }
 }
 
-function helpButtons(view = 'list') {
-  const tabs = [
-    ['list', 'All commands'], ['info', 'About Pip'], ['setup', 'Setup guide'],
-  ];
-  return [new ActionRowBuilder().addComponents(...tabs.map(([id, label]) =>
-    new ButtonBuilder().setCustomId(`pip:cmd:${id}`).setLabel(label)
-      .setStyle(view === id ? ButtonStyle.Primary : ButtonStyle.Secondary)))];
-}
 
-function helpEmbed(view = 'list') {
-  const embed = new EmbedBuilder().setColor(0x8b79db).setFooter({ text: 'Pip • RP activity audits • /cmd list' });
-  if (view === 'info') {
-    return embed.setTitle('🤖 About Pip')
-      .setDescription('Pip checks RP activity across configured text channels, public threads, and accessible forum posts. Audit reports are sent to a designated private staff channel.')
-      .addFields(
-        { name: '🔎 Message-level auditing', value: 'Reports group activity by channel/post and link directly to each original message. Pip only counts accessible activity inside the selected time window.' },
-        { name: '✅ Activity check', value: '`/rpcheck` confirms privately. The only `!` command, `!rpcheck`, reacts ✅ when the audit is posted.' },
-        { name: '🔐 Access', value: 'Members can submit checks. Staff can review audits. Server managers control the bot’s configuration.' },
-        { name: '📚 Explore commands', value: 'Select **All commands** or **Setup guide** below.' },
-      );
-  }
-  if (view === 'setup') {
-    return embed.setTitle('🛠️ Pip • Quick Setup')
-      .setDescription('Use these commands in your Discord server. You must have **Manage Server** permission to configure Pip.')
-      .addFields(
-        { name: '1 • Private log', value: '`/rplogchannel channel:#rp-audit-logs`\nRestrict that channel to your staff.' },
-        { name: '2 • Check-in channel', value: '`/rpcheckchannel channel:#activity-check`' },
-        { name: '3 • Add RP sources', value: '`/rpadd channel:#roleplay-forum`\n`/rpadd channel:#roleplay-chat`\nOr use `thread_id` for a specific thread.' },
-        { name: '4 • Set audit window', value: '`/rphours hours:168` — 7 days' },
-        { name: '5 • Verify and test', value: '`/rplist` · `/rphealth` · `/rpcheck`' },
-        { name: '6 • Member chart', value: '`/rpchart refresh` scans all monitored RP sources. `/rpchart view` shows check-ins vs RP activity; `/rpchart post` maintains a staff-only dashboard. Use `/rpchart track` to include members with neither.' },
-        { name: '7 • Tupperbox RP', value: 'First run `tul!cfg log #tupper-logs` with Tupperbox, then `/tupperlogchannel channel:#tupper-logs` with Pip. Pip credits only proxy messages verified against the official log.' },
-        { name: 'Important for Railway', value: 'Attach a persistent Volume mounted at `/data` so RP channel settings survive redeploys.' },
-      );
-  }
-  return embed.setTitle('📚 Pip • Command Directory')
-    .setDescription('Use slash commands for setup, staff tools, and reports. The only remaining `!` command is **`!rpcheck`**.')
-    .addFields(
-      { name: '🌱 Members', value: '`/rpcheck` or `!rpcheck` — Submit your own RP activity check\n`/cmd list` — Show this help menu\n`/cmd info` — About Pip\n`/ping` — Check whether Pip is online' },
-      { name: '🛡️ Staff', value: '`/rplog member:@user` — Audit a member\n`/rpchart view` — Check-ins vs RP chart\n`/rpchart refresh` — Rescan recent activity\n`/rpchart post` — Update staff dashboard\n`/rplist` — View monitored sources\n`/rphealth` — Check persistent storage' },
-      { name: '⚙️ Server managers', value: '`/rpadd` — Add a channel, forum, or thread\n`/rpremove` — Remove monitored source\n`/rphours` — Set audit hours\n`/rplogchannel` — Set staff audit destination\n`/rpcheckchannel` — Set check-in channel\n`/tupperlogchannel` — Set official Tupperbox log source\n`/tupperdiagnose` — Diagnose log matching\n`/rpchart track` / `/rpchart untrack` — Manage chart roster' },
-      { name: '💡 Setup walkthrough', value: 'Use `/cmd setup` or select the **Setup guide** button below.' },
-    );
-}
-
-function isInteractionManager(interaction) {
-  return interaction.guild?.ownerId === interaction.user.id ||
-    Boolean(interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild));
-}
-
-function isInteractionStaff(interaction) {
-  if (isInteractionManager(interaction)) return true;
-  const roles = interaction.member?.roles;
-  return [...STAFF_ROLE_IDS].some(id => Array.isArray(roles) ? roles.includes(id) : Boolean(roles?.cache?.has(id)));
-}
-
-function slashAuditContext(interaction) {
-  return {
-    _interaction: interaction,
-    guild: interaction.guild,
-    author: interaction.user,
-    channelId: interaction.channelId,
-    content: `/${interaction.commandName}`,
-    commandName: interaction.commandName,
-    url: null,
-  };
-}
-
-async function respondPrivately(interaction, content) {
-  const payload = { content, allowedMentions: { parse: [] } };
-  if (interaction.deferred || interaction.replied) return interaction.editReply(payload);
-  return interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
-}
-
+// =========================================================================
+// 03 — PERSISTENT SERVER CONFIGURATION AND CHART DATA
+// =========================================================================
 // Fail rather than overwrite unreadable data with a blank configuration.
 fs.mkdirSync(DATA_DIR, { recursive: true });
 if (CONFIG_PATH !== LEGACY_CONFIG_PATH && !fs.existsSync(CONFIG_PATH) && fs.existsSync(LEGACY_CONFIG_PATH)) {
@@ -275,6 +211,321 @@ function recordCheckIn(guildId, userId, messageCount) {
   saveChart();
 }
 
+
+// =========================================================================
+// 04 — STAFF PERMISSIONS AND SAFE REPLIES
+// =========================================================================
+function isInteractionManager(interaction) {
+  return interaction.guild?.ownerId === interaction.user.id ||
+    Boolean(interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild));
+}
+
+function isInteractionStaff(interaction) {
+  if (isInteractionManager(interaction)) return true;
+  const roles = interaction.member?.roles;
+  return [...STAFF_ROLE_IDS].some(id => Array.isArray(roles) ? roles.includes(id) : Boolean(roles?.cache?.has(id)));
+}
+
+function slashAuditContext(interaction) {
+  return {
+    _interaction: interaction,
+    guild: interaction.guild,
+    author: interaction.user,
+    channelId: interaction.channelId,
+    content: `/${interaction.commandName}`,
+    commandName: interaction.commandName,
+    url: null,
+  };
+}
+
+async function respondPrivately(interaction, content) {
+  const payload = { content, allowedMentions: { parse: [] } };
+  if (interaction.deferred || interaction.replied) return interaction.editReply(payload);
+  return interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
+}
+
+
+// =========================================================================
+// 05 — SUPPORTED CHANNELS AND VERIFIED TUPPERBOX OWNERSHIP
+// =========================================================================
+function isSupportedChannel(channel) {
+  return channel && [ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(channel.type);
+}
+
+function isSupportedMonitorChannel(channel) {
+  return isSupportedChannel(channel) || channel?.type === ChannelType.GuildForum ||
+    [ChannelType.PublicThread, ChannelType.AnnouncementThread, ChannelType.PrivateThread].includes(channel?.type);
+}
+
+async function reply(message, content) {
+  if (message._interaction) return respondPrivately(message._interaction, content);
+  return message.reply({ content, allowedMentions: { repliedUser: false, parse: [] } });
+}
+
+
+// Tupperbox logs are the source of truth for proxy-message ownership.
+// The visible Tupper name alone is NOT enough to identify a Discord member.
+// Tupperbox emits a staff log embed with "Registered by" and the original
+// Discord message link / message ID. Ignore unverified proxies rather than guessing.
+// Log layouts vary by Tupperbox release. We require *both* an identifiable
+// owner AND the original proxied message ID, never just a character name.
+// A malformed/ambiguous log is ignored to prevent false attribution.
+const MESSAGE_LINK_RE = /https?:\/\/(?:canary\.|ptb\.)?discord(?:app)?\.com\/channels\/(\d{15,22})\/(\d{15,22})\/(\d{15,22})/gi;
+const OWNER_ID_RE = /<@!?(\d{15,22})>|\((\d{15,22})\)|(?:discord\s*)?(?:user|owner|member)\s*id\s*[:#]?\s*(\d{15,22})/i;
+function parseTupperLogEntry(message, guildId) {
+  const embeds = message.embeds?.length ? message.embeds : [{ description: message.content || "" }];
+  for (const embed of embeds) {
+    const fields = embed.fields || [];
+    const val = needle => fields.filter(f => String(f.name || '').toLowerCase().includes(needle))
+      .map(f => String(f.value || '')).join('\n');
+    const ownerSection = [
+      val('registered by'), val('sent by'), val('proxy owner'), val('owner'),
+      val('proxy user'), val('user id'), val('member'),
+    ].filter(Boolean).join('\n');
+    const body = [
+      String(message.content || ''), String(embed.description || ''),
+      String(embed.title || ''), String(embed.author?.name || ''),
+      String(embed.footer?.text || ''),
+      ...fields.map(f => `${f.name}: ${f.value}`),
+    ].join('\n');
+    // If an explicit owner field exists, use ONLY that field; never infer an
+    // owner from a link to a discussion/quoted message within the RP content.
+    const ownerBlock = ownerSection || body.match(/(?:registered by|sent by|proxy owner|tupper owner|owner|user id)\s*[:\-]?\s*([^\n]+)/i)?.[1] || '';
+    const ownerMatch = ownerBlock.match(OWNER_ID_RE)
+      || ownerBlock.match(/(?:^|\D)(\d{15,22})(?:\D|$)/);
+    const ownerId = ownerMatch?.[1] || ownerMatch?.[2] || ownerMatch?.[3];
+    if (!ownerId) continue;
+
+    // Favor the explicit original-message link field if present. If we cannot
+    // identify one, accept a *single* original Discord link in metadata.
+    const originalField = [val('original message'), val('jump to message'), val('message link')]
+      .filter(Boolean).join('\n');
+    const linksIn = text => [...String(text).matchAll(MESSAGE_LINK_RE)]
+      .filter(m => m[1] === guildId).map(m => m[3]);
+    const explicit = linksIn(originalField);
+    const links = explicit.length ? explicit : linksIn(body);
+    const uniqueLinks = [...new Set(links)];
+    let messageId = uniqueLinks.length === 1 ? uniqueLinks[0] : null;
+    // A log may put its original-message ID in the footer rather than a URL.
+    const idText = [val('message id'), String(embed.footer?.text || '')].join(' ');
+    const idMatch = idText.match(/(?:original\s*)?message\s*id[^\d]*(\d{15,22})/i)
+      || idText.trim().match(/^(\d{15,22})$/);
+    if (!messageId && uniqueLinks.length === 0 && idMatch) messageId = idMatch[1];
+    if (messageId && idMatch && messageId !== idMatch[1]) continue;
+    if (!messageId) continue;
+    // Discord IDs are stable. Never derive an owner from Tupper display names.
+    return { messageId, ownerId, tupperName: String(embed.title || embed.author?.name || '').slice(0, 80) };
+  }
+  return null;
+}
+
+// The return stats deliberately omit message text, IDs and member identities.
+// They help staff distinguish missing logs from unsupported log formatting.
+async function loadTupperOwnersUncached(guild, cutoff, diagnostic = false) {
+  const cfg = settings(guild.id);
+  const owners = new Map();
+  const warnings = [];
+  const stats = { logChannelConfigured: Boolean(cfg.tupperLogChannel), accessible: false,
+    inspected: 0, officialLogMessages: 0, attributed: 0, unparsedOfficial: 0,
+    otherAuthors: 0, sampleFieldNames: [] };
+  if (!cfg.tupperLogChannel) return { owners, warnings, stats };
+  const channel = await guild.channels.fetch(cfg.tupperLogChannel).catch(() => null);
+  if (!isSupportedChannel(channel)) {
+    warnings.push('Tupperbox log channel missing or inaccessible; Tupper RP cannot be credited.');
+    return { owners, warnings, stats };
+  }
+  stats.accessible = true;
+  let before;
+  const pageLimit = diagnostic ? 1 : MAX_PAGES_PER_CHANNEL;
+  for (let page = 0; page < pageLimit; page++) {
+    try {
+      const batch = await channel.messages.fetch({ limit: diagnostic ? 50 : 100, cache: false, ...(before ? { before } : {}) });
+      if (!batch.size) break;
+      const messages = [...batch.values()];
+      let older = false;
+      for (const m of messages) {
+        if (m.createdTimestamp < cutoff) { older = true; break; }
+        stats.inspected++;
+        if (m.author?.id !== TUPPERBOX_BOT_ID) { stats.otherAuthors++; continue; }
+        stats.officialLogMessages++;
+        const ownership = parseTupperLogEntry(m, guild.id);
+        if (ownership) {
+          owners.set(ownership.messageId, ownership);
+          stats.attributed++;
+        } else {
+          stats.unparsedOfficial++;
+          if (!stats.sampleFieldNames.length) {
+            stats.sampleFieldNames = [...new Set((m.embeds || []).flatMap(e =>
+              (e.fields || []).map(f => String(f.name).slice(0, 60))))].slice(0, 8);
+          }
+        }
+      }
+      if (older || batch.size < (diagnostic ? 50 : 100)) break;
+      before = messages[messages.length - 1].id;
+      if (!diagnostic && page === MAX_PAGES_PER_CHANNEL - 1) warnings.push('Tupperbox log reached 5,000-message scan cap; some proxy messages may be missing.');
+    } catch (err) {
+      console.error('Cannot read Tupperbox logs:', err);
+      warnings.push('Unable to read Tupperbox log history; Tupper messages may be undercounted.');
+      break;
+    }
+  }
+  if (stats.officialLogMessages && !stats.attributed) {
+    warnings.push('Tupperbox logs found but no ownership could be parsed. Run /tupperdiagnose and share a redacted example log embed to fix its layout.');
+  } else if (stats.inspected && !stats.officialLogMessages) {
+    warnings.push('Messages found in Tupperbox log channel, but none from the configured official Tupperbox bot ID. Verify the log source and bot ID.');
+  }
+  return { owners, warnings, stats };
+}
+
+// Cache Tupperbox ownership briefly. A new official Tupperbox log invalidates it.
+// Diagnostics always fetch fresh data so permission / formatting problems are visible.
+async function getTupperOwners(guild, cutoff, diagnostic = false) {
+  if (diagnostic) return loadTupperOwnersUncached(guild, cutoff, true);
+  const cached = tupperOwnerCache.get(guild.id);
+  if (cached && cached.cutoff <= cutoff && cached.expiresAt > Date.now()) return cached.promise;
+  const promise = loadTupperOwnersUncached(guild, cutoff).catch(error => {
+    if (tupperOwnerCache.get(guild.id)?.promise === promise) tupperOwnerCache.delete(guild.id);
+    throw error;
+  });
+  tupperOwnerCache.set(guild.id, { cutoff, expiresAt: Date.now() + TUPPER_CACHE_MS, promise });
+  return promise;
+}
+
+
+// =========================================================================
+// 06 — SCAN RP MESSAGES, PUBLIC THREADS, AND FORUM POSTS
+// =========================================================================
+// Read a configurable time window, paging backward until before the cutoff.
+async function scanChannel(channel, userId, cutoff, owners = new Map()) {
+  const key = `${channel.id}:${userId || 'all'}`;
+  const hit = channelScanCache.get(key);
+  if (hit && hit.expiresAt > Date.now() && hit.cutoff <= cutoff) {
+    return { matches: hit.matches.filter(m => m.createdTimestamp >= cutoff), truncated: hit.truncated };
+  }
+  if (hit) channelScanCache.delete(key);
+  let before;
+  let truncated = false;
+  const matches = [];
+
+  for (let page = 0; page < MAX_PAGES_PER_CHANNEL; page++) {
+    const options = { limit: 100, cache: false };
+    if (before) options.before = before;
+    const batch = await channel.messages.fetch(options);
+    if (batch.size === 0) break;
+
+    const messages = [...batch.values()];
+    let foundOldMessage = false;
+    for (const m of messages) {
+      if (m.createdTimestamp < cutoff) {
+        foundOldMessage = true;
+        break;
+      }
+      const attribution = m.webhookId ? owners.get(m.id) : null;
+      const ownerId = attribution?.ownerId || (!m.author.bot && !m.webhookId ? m.author.id : null);
+      if (ownerId && (!userId || ownerId === userId)) {
+        m._pipOwnerId = ownerId;
+        m._pipTupperName = attribution ? (attribution.tupperName || m.author.username) : null;
+        matches.push(m);
+      }
+    }
+
+    if (foundOldMessage || batch.size < 100) break;
+    before = messages[messages.length - 1].id;
+    if (page === MAX_PAGES_PER_CHANNEL - 1) truncated = true;
+  }
+  // Cache matched messages only (not every scanned message), avoiding huge memory use.
+  // New messages and Tupperbox log entries invalidate affected cached scans.
+  if (matches.length <= 150) {
+    if (channelScanCache.size >= MAX_SCAN_CACHE_ENTRIES) {
+      channelScanCache.delete(channelScanCache.keys().next().value);
+    }
+    channelScanCache.set(key, { matches, truncated, cutoff, expiresAt: Date.now() + SCAN_CACHE_MS });
+  }
+  return { matches, truncated };
+}
+
+// Public posts in forums are threads. Regular text channels also have threads.
+// We scan PUBLIC threads automatically under a configured parent channel.
+// A private thread is scanned only if explicitly configured by ID and readable by Pip.
+async function collectPublicThreads(parent, cutoff) {
+  const threads = new Map();
+  const warnings = [];
+  try {
+    const active = await parent.threads.fetchActive(false);
+    for (const thread of active.threads.values()) {
+      if (thread.type === ChannelType.PrivateThread) continue;
+      if (threads.size >= MAX_THREADS_PER_PARENT) {
+        warnings.push(`#${parent.name}: reached ${MAX_THREADS_PER_PARENT}-thread cap`);
+        break;
+      }
+      threads.set(thread.id, thread);
+    }
+  } catch (error) {
+    console.error(`Cannot list active threads in ${parent.name}:`, error);
+    warnings.push(`#${parent.name}: could not list active threads`);
+  }
+
+  let before;
+  if (threads.size < MAX_THREADS_PER_PARENT) {
+    try {
+      for (let page = 0; page < MAX_ARCHIVED_THREAD_PAGES; page++) {
+        const opts = { type: 'public', limit: 100 };
+        if (before) opts.before = before;
+        const result = await parent.threads.fetchArchived(opts, false);
+        const archived = [...result.threads.values()];
+        if (!archived.length) break;
+        let earliest = Infinity;
+        for (const thread of archived) {
+          const stamp = thread.archiveTimestamp ?? thread.createdTimestamp ?? Date.now();
+          earliest = Math.min(earliest, stamp);
+          if (stamp < cutoff || threads.has(thread.id)) continue;
+          if (threads.size >= MAX_THREADS_PER_PARENT) {
+            warnings.push(`#${parent.name}: reached ${MAX_THREADS_PER_PARENT}-thread cap`);
+            break;
+          }
+          threads.set(thread.id, thread);
+        }
+        if (threads.size >= MAX_THREADS_PER_PARENT || !result.hasMore || earliest < cutoff) break;
+        if (page === MAX_ARCHIVED_THREAD_PAGES - 1) {
+          warnings.push(`#${parent.name}: reached archived-thread pagination cap`);
+          break;
+        }
+        before = new Date(earliest - 1);
+      }
+    } catch (error) {
+      console.error(`Cannot list archived threads in ${parent.name}:`, error);
+      warnings.push(`#${parent.name}: could not list archived public threads`);
+    }
+  }
+  return { threads: [...threads.values()], warnings };
+}
+
+async function scanChildThreads(parent, userId, cutoff, owners = new Map()) {
+  const { threads, warnings } = await collectPublicThreads(parent, cutoff);
+  const matches = [];
+  let searchedThreads = 0;
+  await mapWithConcurrency(threads, MAX_CONCURRENT_THREADS, async thread => {
+    // The last message Snowflake tells us whether the thread could contain
+    // RP activity inside the requested window. Unknown IDs are never skipped.
+    const lastMessageAt = snowflakeTimestamp(thread.lastMessageId);
+    if (lastMessageAt && lastMessageAt < cutoff) return;
+    try {
+      const result = await scanChannel(thread, userId, cutoff, owners);
+      searchedThreads++;
+      matches.push(...result.matches);
+      if (result.truncated) warnings.push(`#${parent.name} / ${thread.name}: reached 5,000-message cap`);
+    } catch (error) {
+      console.error(`Cannot read thread ${thread.id}:`, error);
+      warnings.push(`#${parent.name} / ${thread.name}: could not read messages`);
+    }
+  });
+  return { matches, warnings, searchedThreads };
+}
+
+
+// =========================================================================
+// 07 — CHART REFRESH, NICKNAME LOOKUP, AND DASHBOARD
+// =========================================================================
 function cleanNick(name) {
   return truncate(String(name || 'Unknown member').replace(/[\r\n`*_~|<>]/g, ' ').replace(/@everyone|@here/gi, '[mention]'), 54);
 }
@@ -303,12 +554,13 @@ async function refreshActivityChart(guild) {
   if (!cfg.rpChannels.length) throw new Error('No RP channels configured. Use /rpadd first.');
   const cutoff = Date.now() - cfg.hours * 60 * 60 * 1000;
   const uniqueMessages = new Map();
-  const { owners, warnings } = await getTupperOwners(guild, cutoff);
-  for (const id of cfg.rpChannels) {
+  const { owners, warnings: ownershipWarnings } = await getTupperOwners(guild, cutoff);
+  const warnings = [...ownershipWarnings];
+  await mapWithConcurrency(cfg.rpChannels, MAX_CONCURRENT_SOURCES, async id => {
     const channel = await guild.channels.fetch(id).catch(() => null);
     if (!isSupportedMonitorChannel(channel)) {
       warnings.push(`Monitored source ${id} is missing or unsupported`);
-      continue;
+      return;
     }
     try {
       if (channel.type === ChannelType.GuildForum) {
@@ -320,8 +572,9 @@ async function refreshActivityChart(guild) {
         result.matches.forEach(m => uniqueMessages.set(m.id, m));
         if (result.truncated) warnings.push(`${channel.name}: scan limit reached`);
       } else {
-        const own = await scanChannel(channel, null, cutoff, owners);
-        const children = await scanChildThreads(channel, null, cutoff, owners);
+        const [own, children] = await Promise.all([
+          scanChannel(channel, null, cutoff, owners), scanChildThreads(channel, null, cutoff, owners),
+        ]);
         [...own.matches, ...children.matches].forEach(m => uniqueMessages.set(m.id, m));
         if (own.truncated) warnings.push(`${channel.name}: scan limit reached`);
         warnings.push(...children.warnings);
@@ -330,7 +583,7 @@ async function refreshActivityChart(guild) {
       console.error(`Cannot refresh chart for ${id}`, error);
       warnings.push(`${channel.name}: messages inaccessible`);
     }
-  }
+  });
   const chart = chartSettings(guild.id);
   const at = Date.now();
   const activity = {};
@@ -429,257 +682,10 @@ async function updateChartDashboard(guild) {
   return posted;
 }
 
-function isSupportedChannel(channel) {
-  return channel && [ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(channel.type);
-}
 
-function isSupportedMonitorChannel(channel) {
-  return isSupportedChannel(channel) || channel?.type === ChannelType.GuildForum ||
-    [ChannelType.PublicThread, ChannelType.AnnouncementThread, ChannelType.PrivateThread].includes(channel?.type);
-}
-
-async function reply(message, content) {
-  if (message._interaction) return respondPrivately(message._interaction, content);
-  return message.reply({ content, allowedMentions: { repliedUser: false, parse: [] } });
-}
-
-// Tupperbox logs are the source of truth for proxy-message ownership.
-// The visible Tupper name alone is NOT enough to identify a Discord member.
-// Tupperbox emits a staff log embed with "Registered by" and the original
-// Discord message link / message ID. Ignore unverified proxies rather than guessing.
-// Log layouts vary by Tupperbox release. We require *both* an identifiable
-// owner AND the original proxied message ID, never just a character name.
-// A malformed/ambiguous log is ignored to prevent false attribution.
-const MESSAGE_LINK_RE = /https?:\/\/(?:canary\.|ptb\.)?discord(?:app)?\.com\/channels\/(\d{15,22})\/(\d{15,22})\/(\d{15,22})/gi;
-const OWNER_ID_RE = /<@!?(\d{15,22})>|\((\d{15,22})\)|(?:discord\s*)?(?:user|owner|member)\s*id\s*[:#]?\s*(\d{15,22})/i;
-function parseTupperLogEntry(message, guildId) {
-  const embeds = message.embeds?.length ? message.embeds : [{ description: message.content || "" }];
-  for (const embed of embeds) {
-    const fields = embed.fields || [];
-    const val = needle => fields.filter(f => String(f.name || '').toLowerCase().includes(needle))
-      .map(f => String(f.value || '')).join('\n');
-    const ownerSection = [
-      val('registered by'), val('sent by'), val('proxy owner'), val('owner'),
-      val('proxy user'), val('user id'), val('member'),
-    ].filter(Boolean).join('\n');
-    const body = [
-      String(message.content || ''), String(embed.description || ''),
-      String(embed.title || ''), String(embed.author?.name || ''),
-      String(embed.footer?.text || ''),
-      ...fields.map(f => `${f.name}: ${f.value}`),
-    ].join('\n');
-    // If an explicit owner field exists, use ONLY that field; never infer an
-    // owner from a link to a discussion/quoted message within the RP content.
-    const ownerBlock = ownerSection || body.match(/(?:registered by|sent by|proxy owner|tupper owner|owner|user id)\s*[:\-]?\s*([^\n]+)/i)?.[1] || '';
-    const ownerMatch = ownerBlock.match(OWNER_ID_RE)
-      || ownerBlock.match(/(?:^|\D)(\d{15,22})(?:\D|$)/);
-    const ownerId = ownerMatch?.[1] || ownerMatch?.[2] || ownerMatch?.[3];
-    if (!ownerId) continue;
-
-    // Favor the explicit original-message link field if present. If we cannot
-    // identify one, accept a *single* original Discord link in metadata.
-    const originalField = [val('original message'), val('jump to message'), val('message link')]
-      .filter(Boolean).join('\n');
-    const linksIn = text => [...String(text).matchAll(MESSAGE_LINK_RE)]
-      .filter(m => m[1] === guildId).map(m => m[3]);
-    const explicit = linksIn(originalField);
-    const links = explicit.length ? explicit : linksIn(body);
-    const uniqueLinks = [...new Set(links)];
-    let messageId = uniqueLinks.length === 1 ? uniqueLinks[0] : null;
-    // A log may put its original-message ID in the footer rather than a URL.
-    const idText = [val('message id'), String(embed.footer?.text || '')].join(' ');
-    const idMatch = idText.match(/(?:original\s*)?message\s*id[^\d]*(\d{15,22})/i)
-      || idText.trim().match(/^(\d{15,22})$/);
-    if (!messageId && uniqueLinks.length === 0 && idMatch) messageId = idMatch[1];
-    if (messageId && idMatch && messageId !== idMatch[1]) continue;
-    if (!messageId) continue;
-    // Discord IDs are stable. Never derive an owner from Tupper display names.
-    return { messageId, ownerId, tupperName: String(embed.title || embed.author?.name || '').slice(0, 80) };
-  }
-  return null;
-}
-
-// The return stats deliberately omit message text, IDs and member identities.
-// They help staff distinguish missing logs from unsupported log formatting.
-async function getTupperOwners(guild, cutoff, diagnostic = false) {
-  const cfg = settings(guild.id);
-  const owners = new Map();
-  const warnings = [];
-  const stats = { logChannelConfigured: Boolean(cfg.tupperLogChannel), accessible: false,
-    inspected: 0, officialLogMessages: 0, attributed: 0, unparsedOfficial: 0,
-    otherAuthors: 0, sampleFieldNames: [] };
-  if (!cfg.tupperLogChannel) return { owners, warnings, stats };
-  const channel = await guild.channels.fetch(cfg.tupperLogChannel).catch(() => null);
-  if (!isSupportedChannel(channel)) {
-    warnings.push('Tupperbox log channel missing or inaccessible; Tupper RP cannot be credited.');
-    return { owners, warnings, stats };
-  }
-  stats.accessible = true;
-  let before;
-  const pageLimit = diagnostic ? 1 : MAX_PAGES_PER_CHANNEL;
-  for (let page = 0; page < pageLimit; page++) {
-    try {
-      const batch = await channel.messages.fetch({ limit: diagnostic ? 50 : 100, cache: false, ...(before ? { before } : {}) });
-      if (!batch.size) break;
-      const messages = [...batch.values()];
-      let older = false;
-      for (const m of messages) {
-        if (m.createdTimestamp < cutoff) { older = true; break; }
-        stats.inspected++;
-        if (m.author?.id !== TUPPERBOX_BOT_ID) { stats.otherAuthors++; continue; }
-        stats.officialLogMessages++;
-        const ownership = parseTupperLogEntry(m, guild.id);
-        if (ownership) {
-          owners.set(ownership.messageId, ownership);
-          stats.attributed++;
-        } else {
-          stats.unparsedOfficial++;
-          if (!stats.sampleFieldNames.length) {
-            stats.sampleFieldNames = [...new Set((m.embeds || []).flatMap(e =>
-              (e.fields || []).map(f => String(f.name).slice(0, 60))))].slice(0, 8);
-          }
-        }
-      }
-      if (older || batch.size < (diagnostic ? 50 : 100)) break;
-      before = messages[messages.length - 1].id;
-      if (!diagnostic && page === MAX_PAGES_PER_CHANNEL - 1) warnings.push('Tupperbox log reached 5,000-message scan cap; some proxy messages may be missing.');
-    } catch (err) {
-      console.error('Cannot read Tupperbox logs:', err);
-      warnings.push('Unable to read Tupperbox log history; Tupper messages may be undercounted.');
-      break;
-    }
-  }
-  if (stats.officialLogMessages && !stats.attributed) {
-    warnings.push('Tupperbox logs found but no ownership could be parsed. Run /tupperdiagnose and share a redacted example log embed to fix its layout.');
-  } else if (stats.inspected && !stats.officialLogMessages) {
-    warnings.push('Messages found in Tupperbox log channel, but none from the configured official Tupperbox bot ID. Verify the log source and bot ID.');
-  }
-  return { owners, warnings, stats };
-}
-
-async function sendAuditToStaff(logChannel, payload, guildId) {
-  const posted = await logChannel.send(payload);
-  if (mirrorWebhook && guildId === AUDIT_WEBHOOK_GUILD_ID) {
-    try {
-      // Mirror the same summary and direct-message links to a second staff-only
-      // channel. Webhook URL is a secret stored in Railway Variables, not Discord.
-      await mirrorWebhook.send({ ...payload, username: 'Pip RP Audit', allowedMentions: { parse: [] } });
-    } catch (error) {
-      console.error('Could not mirror staff audit to the configured webhook:', error);
-    }
-  }
-  return posted;
-}
-
-// Read a configurable time window, paging backward until before the cutoff.
-async function scanChannel(channel, userId, cutoff, owners = new Map()) {
-  let before;
-  let truncated = false;
-  const matches = [];
-
-  for (let page = 0; page < MAX_PAGES_PER_CHANNEL; page++) {
-    const options = { limit: 100, cache: false };
-    if (before) options.before = before;
-    const batch = await channel.messages.fetch(options);
-    if (batch.size === 0) break;
-
-    const messages = [...batch.values()];
-    let foundOldMessage = false;
-    for (const m of messages) {
-      if (m.createdTimestamp < cutoff) {
-        foundOldMessage = true;
-        break;
-      }
-      const attribution = m.webhookId ? owners.get(m.id) : null;
-      const ownerId = attribution?.ownerId || (!m.author.bot && !m.webhookId ? m.author.id : null);
-      if (ownerId && (!userId || ownerId === userId)) {
-        m._pipOwnerId = ownerId;
-        m._pipTupperName = attribution ? (attribution.tupperName || m.author.username) : null;
-        matches.push(m);
-      }
-    }
-
-    if (foundOldMessage || batch.size < 100) break;
-    before = messages[messages.length - 1].id;
-    if (page === MAX_PAGES_PER_CHANNEL - 1) truncated = true;
-  }
-  return { matches, truncated };
-}
-
-// Public posts in forums are threads. Regular text channels also have threads.
-// We scan PUBLIC threads automatically under a configured parent channel.
-// A private thread is scanned only if explicitly configured by ID and readable by Pip.
-async function collectPublicThreads(parent, cutoff) {
-  const threads = new Map();
-  const warnings = [];
-  try {
-    const active = await parent.threads.fetchActive(false);
-    for (const thread of active.threads.values()) {
-      if (thread.type === ChannelType.PrivateThread) continue;
-      if (threads.size >= MAX_THREADS_PER_PARENT) {
-        warnings.push(`#${parent.name}: reached ${MAX_THREADS_PER_PARENT}-thread cap`);
-        break;
-      }
-      threads.set(thread.id, thread);
-    }
-  } catch (error) {
-    console.error(`Cannot list active threads in ${parent.name}:`, error);
-    warnings.push(`#${parent.name}: could not list active threads`);
-  }
-
-  let before;
-  if (threads.size < MAX_THREADS_PER_PARENT) {
-    try {
-      for (let page = 0; page < MAX_ARCHIVED_THREAD_PAGES; page++) {
-        const opts = { type: 'public', limit: 100 };
-        if (before) opts.before = before;
-        const result = await parent.threads.fetchArchived(opts, false);
-        const archived = [...result.threads.values()];
-        if (!archived.length) break;
-        let earliest = Infinity;
-        for (const thread of archived) {
-          const stamp = thread.archiveTimestamp ?? thread.createdTimestamp ?? Date.now();
-          earliest = Math.min(earliest, stamp);
-          if (stamp < cutoff || threads.has(thread.id)) continue;
-          if (threads.size >= MAX_THREADS_PER_PARENT) {
-            warnings.push(`#${parent.name}: reached ${MAX_THREADS_PER_PARENT}-thread cap`);
-            break;
-          }
-          threads.set(thread.id, thread);
-        }
-        if (threads.size >= MAX_THREADS_PER_PARENT || !result.hasMore || earliest < cutoff) break;
-        if (page === MAX_ARCHIVED_THREAD_PAGES - 1) {
-          warnings.push(`#${parent.name}: reached archived-thread pagination cap`);
-          break;
-        }
-        before = new Date(earliest - 1);
-      }
-    } catch (error) {
-      console.error(`Cannot list archived threads in ${parent.name}:`, error);
-      warnings.push(`#${parent.name}: could not list archived public threads`);
-    }
-  }
-  return { threads: [...threads.values()], warnings };
-}
-
-async function scanChildThreads(parent, userId, cutoff, owners = new Map()) {
-  const { threads, warnings } = await collectPublicThreads(parent, cutoff);
-  const matches = [];
-  let searchedThreads = 0;
-  for (const thread of threads) {
-    try {
-      const result = await scanChannel(thread, userId, cutoff, owners);
-      searchedThreads++;
-      matches.push(...result.matches);
-      if (result.truncated) warnings.push(`#${parent.name} / ${thread.name}: reached 5,000-message cap`);
-    } catch (error) {
-      console.error(`Cannot read thread ${thread.id}:`, error);
-      warnings.push(`#${parent.name} / ${thread.name}: could not read messages`);
-    }
-  }
-  return { matches, warnings, searchedThreads };
-}
-
+// =========================================================================
+// 08 — AUDIT FORMATTING, WEBHOOK MIRROR, AND STAFF REPORTS
+// =========================================================================
 function cleanContent(message) {
   let preview = (message.content || '').replace(/\s+/g, ' ').trim();
   if (!preview) {
@@ -726,7 +732,23 @@ function paginateDetails(header, lines, maximum = 1850) {
   return pages;
 }
 
+
+// The optional webhook should never hold up a member's ✅ or their primary staff report.
+// Preserve webhook message order and log any delivery errors.
+let webhookQueue = Promise.resolve();
+async function sendAuditToStaff(logChannel, payload, guildId) {
+  const posted = await logChannel.send(payload);
+  if (mirrorWebhook && guildId === AUDIT_WEBHOOK_GUILD_ID) {
+    webhookQueue = webhookQueue.then(() => mirrorWebhook.send({
+      ...payload, username: 'Pip RP Audit', allowedMentions: { parse: [] },
+    })).catch(error => console.error('Could not mirror staff audit to webhook:', error));
+  }
+  return posted;
+}
+
+
 async function runAudit(originMessage, targetUser) {
+  const auditStartedAt = Date.now();
   const cfg = settings(originMessage.guild.id);
   if (!cfg.logChannel || cfg.rpChannels.length === 0) {
     return reply(originMessage, 'RP check is not configured yet. Staff: use `/rplogchannel` and `/rpadd`.');
@@ -739,15 +761,16 @@ async function runAudit(originMessage, targetUser) {
 
   const cutoff = Date.now() - cfg.hours * 60 * 60 * 1000;
   const foundById = new Map(); // avoids duplicate results when both a parent and its thread are configured
-  const { owners, warnings } = await getTupperOwners(originMessage.guild, cutoff);
+  const { owners, warnings: ownershipWarnings } = await getTupperOwners(originMessage.guild, cutoff);
+  const warnings = [...ownershipWarnings];
   let scannedSources = 0;
   let scannedPosts = 0;
 
-  for (const channelId of cfg.rpChannels) {
+  await mapWithConcurrency(cfg.rpChannels, MAX_CONCURRENT_SOURCES, async channelId => {
     const channel = await originMessage.guild.channels.fetch(channelId).catch(() => null);
     if (!isSupportedMonitorChannel(channel)) {
       warnings.push(`Channel ID ${channelId}: missing or unsupported`);
-      continue;
+      return;
     }
     scannedSources++;
     try {
@@ -761,8 +784,10 @@ async function runAudit(originMessage, targetUser) {
         for (const m of result.matches) foundById.set(m.id, m);
         if (result.truncated) warnings.push(`${channel.name}: reached 5,000-message scan limit`);
       } else {
-        const own = await scanChannel(channel, targetUser.id, cutoff, owners);
-        const child = await scanChildThreads(channel, targetUser.id, cutoff, owners);
+        const [own, child] = await Promise.all([
+          scanChannel(channel, targetUser.id, cutoff, owners),
+          scanChildThreads(channel, targetUser.id, cutoff, owners),
+        ]);
         scannedPosts += child.searchedThreads;
         for (const m of [...own.matches, ...child.matches]) foundById.set(m.id, m);
         if (own.truncated) warnings.push(`${channel.name}: reached 5,000-message scan limit`);
@@ -772,7 +797,7 @@ async function runAudit(originMessage, targetUser) {
       console.error(`Cannot audit channel ${channelId}:`, error);
       warnings.push(`${channel.name}: could not read message history`);
     }
-  }
+  });
 
   const found = [...foundById.values()].sort((a, b) => b.createdTimestamp - a.createdTimestamp);
   const byLocation = new Map();
@@ -844,31 +869,35 @@ async function runAudit(originMessage, targetUser) {
     summaryEmbed.addFields({ name: 'Scan notes', value: truncate(warnings.map(w => `• ${w}`).join('\n'), 900) });
   }
 
-  // Searchable plain-text heading and visually organized summary embed.
-  await sendAuditToStaff(logChannel, {
-    content: `${searchableTag}\n${linkToCheck}`,
-    embeds: [summaryEmbed],
-    allowedMentions: { parse: [] },
-  }, originMessage.guild.id);
+  // Scan jobs run concurrently, but staff messages from each report stay grouped.
+  await sendReportTogether(async () => {
+    // Searchable plain-text heading and visually organized summary embed.
+    await sendAuditToStaff(logChannel, {
+      content: `${searchableTag}\n${linkToCheck}`,
+      embeds: [summaryEmbed],
+      allowedMentions: { parse: [] },
+    }, originMessage.guild.id);
 
-  // Message records grouped by actual post/thread/channel. Each original link
-  // opens directly on the member's individual message in Discord.
-  for (const location of locations) {
-    const place = getLocationLabel(location.channel);
-    const header = `${searchableTag}\n📍 **${truncate(place, 130)}** — ${location.messages.length} message(s)\n`;
-    const lines = location.messages.map(m => {
-      const stamp = Math.floor(m.createdTimestamp / 1000);
-      const link = m.url || `https://discord.com/channels/${originMessage.guild.id}/${m.channelId}/${m.id}`;
-      const actor = m._pipTupperName ? `🎭 **${truncate(m._pipTupperName, 75)}** — ` : '';
-      return `${actor}**<t:${stamp}:f>** — ${cleanContent(m)}\n🔗 ${link}\n`;
-    });
-    const pages = paginateDetails(header, lines);
-    for (let i = 0; i < pages.length; i++) {
-      // Multi-page records repeat the place + member ID for staff search.
-      const suffix = pages.length > 1 ? `\n*${i + 1}/${pages.length} pages for this location*` : '';
-      await sendAuditToStaff(logChannel, { content: `${pages[i]}${suffix}`, allowedMentions: { parse: [] } }, originMessage.guild.id);
+    // Message records grouped by actual post/thread/channel. Each original link
+    // opens directly on the member's individual message in Discord.
+    for (const location of locations) {
+      const place = getLocationLabel(location.channel);
+      const header = `${searchableTag}\n📍 **${truncate(place, 130)}** — ${location.messages.length} message(s)\n`;
+      const lines = location.messages.map(m => {
+        const stamp = Math.floor(m.createdTimestamp / 1000);
+        const link = m.url || `https://discord.com/channels/${originMessage.guild.id}/${m.channelId}/${m.id}`;
+        const actor = m._pipTupperName ? `🎭 **${truncate(m._pipTupperName, 75)}** — ` : '';
+        return `${actor}**<t:${stamp}:f>** — ${cleanContent(m)}\n🔗 ${link}\n`;
+      });
+      const pages = paginateDetails(header, lines);
+      for (let i = 0; i < pages.length; i++) {
+        // Multi-page records repeat the place + member ID for staff search.
+        const suffix = pages.length > 1 ? `\n*${i + 1}/${pages.length} pages for this location*` : '';
+        await sendAuditToStaff(logChannel, { content: `${pages[i]}${suffix}`, allowedMentions: { parse: [] } }, originMessage.guild.id);
+      }
     }
-  }
+
+  });
 
   // Only a member's own successful !rpcheck or /rpcheck counts as a check-in.
   // Staff /rplog audits never count as submitted checks.
@@ -878,8 +907,9 @@ async function runAudit(originMessage, targetUser) {
   if (isSelfCheck) {
     try {
       recordCheckIn(originMessage.guild.id, targetUser.id, found.length);
-      const chart = chartSettings(originMessage.guild.id);
-      if (chart.dashboard?.messageId) await updateChartDashboard(originMessage.guild);
+      // Defer chart updates: 15 fresh nickname lookups + message edit are expensive.
+      // Coalesced update runs shortly after the checkmark, not before it.
+      scheduleDashboardUpdate(originMessage.guild);
     } catch (error) {
       console.error('Could not save/update check-in chart:', error);
     }
@@ -887,28 +917,176 @@ async function runAudit(originMessage, targetUser) {
 
   // Slash commands have no ordinary user message to react to. Confirm them
   // privately; retain ✅ on the original message for !rpcheck.
+  const elapsed = ((Date.now() - auditStartedAt) / 1000).toFixed(1);
+  console.log(`Pip audit: guild=${originMessage.guild.id}, member=${targetUser.id}, messages=${found.length}, sources=${scannedSources}, inspectedThreads=${scannedPosts}, seconds=${elapsed}`);
   if (originMessage._interaction) {
-    await reply(originMessage, `✅ RP audit posted to <#${cfg.logChannel}>. Found **${found.length}** message(s) across **${locations.length}** active location(s).`);
+    await reply(originMessage, `✅ RP audit posted to <#${cfg.logChannel}>. Found **${found.length}** message(s) across **${locations.length}** active location(s). Completed in **${elapsed}s**.`);
   } else {
-    await originMessage.react('✅');
-    if (originMessage.content.trim().toLowerCase() !== '!rpcheck') {
-      await reply(originMessage, `Audit posted in <#${cfg.logChannel}> (${found.length} message(s) across ${locations.length} active location(s)).`);
-    }
+    await originMessage.react('✅').catch(() => {});
+    await removePendingReaction(originMessage);
   }
 }
 
-// Serialize audits so multi-page reports from different users don't mix.
-let auditQueue = Promise.resolve();
-function enqueueAudit(message, user) {
-  const task = auditQueue.then(() => runAudit(message, user));
-  auditQueue = task.catch(() => {});
-  task.catch(async err => {
-    console.error('RP audit failed:', err);
-    await reply(message, 'Could not finish the audit. Check bot permissions and the console.').catch(() => {});
-  });
+
+// =========================================================================
+// 09 — BOUNDED AUDIT QUEUE, REACTIONS, AND BACKGROUND UPDATES
+// =========================================================================
+// Only publishing to the staff channel is serialized; scanning can overlap.
+let reportQueue = Promise.resolve();
+function sendReportTogether(fn) {
+  const task = reportQueue.then(fn);
+  reportQueue = task.catch(() => {});
   return task;
 }
 
+// Never allow unlimited simultaneous full-history audits (avoids API floods).
+let activeAuditJobs = 0;
+const auditWaiters = [];
+async function withAuditSlot(job) {
+  if (activeAuditJobs >= MAX_CONCURRENT_AUDITS) {
+    // This waiter receives the released slot directly (no concurrency race).
+    await new Promise(resolve => auditWaiters.push(resolve));
+  } else {
+    activeAuditJobs++;
+  }
+  try { return await job(); }
+  finally {
+    const next = auditWaiters.shift();
+    if (next) next();
+    else activeAuditJobs--;
+  }
+}
+
+async function removePendingReaction(message) {
+  if (message._interaction) return;
+  const reaction = message.reactions?.cache?.find(r => r.emoji.name === '⏳');
+  if (reaction) await reaction.users.remove(client.user.id).catch(() => {});
+}
+
+const dashboardTimers = new Map();
+function scheduleDashboardUpdate(guild) {
+  if (!chartSettings(guild.id).dashboard?.messageId) return;
+  if (dashboardTimers.has(guild.id)) clearTimeout(dashboardTimers.get(guild.id));
+  dashboardTimers.set(guild.id, setTimeout(() => {
+    dashboardTimers.delete(guild.id);
+    updateChartDashboard(guild).catch(error => console.error('Could not refresh chart:', error));
+  }, 1500));
+}
+
+function enqueueAudit(message, user) {
+  const task = withAuditSlot(() => runAudit(message, user));
+  task.catch(async error => {
+    console.error('RP audit failed:', error);
+    await removePendingReaction(message);
+    if (!message._interaction) await message.react('❌').catch(() => {});
+    await reply(message, 'Could not finish the audit. Check bot permissions and Railway Deploy Logs.').catch(() => {});
+  }).finally(() => removePendingReaction(message).catch(() => {}));
+  return task;
+}
+
+
+// =========================================================================
+// 10 — SLASH COMMAND DEFINITIONS, HELP EMBEDS, AND ACCESS
+// =========================================================================
+// Slash commands are registered to each server after Pip connects. Guild commands
+// normally appear immediately in Discord's / command picker (no portal form needed).
+const SLASH_COMMANDS = [
+  new SlashCommandBuilder().setName('rpcheck').setDescription('Submit your own RP activity check.'),
+  new SlashCommandBuilder().setName('rplog').setDescription('Staff: audit a member’s recent RP messages.')
+    .addUserOption(o => o.setName('member').setDescription('Member to audit').setRequired(true)),
+  new SlashCommandBuilder().setName('rpadd').setDescription('Admin: monitor an RP channel, forum, or thread.')
+    .addChannelOption(o => o.setName('channel').setDescription('RP channel or forum (including its public threads)').setRequired(false))
+    .addStringOption(o => o.setName('thread_id').setDescription('Optional: exact thread ID instead of a channel').setRequired(false)),
+  new SlashCommandBuilder().setName('rpremove').setDescription('Admin: stop monitoring an RP channel, forum, or thread.')
+    .addChannelOption(o => o.setName('channel').setDescription('Previously monitored channel or forum').setRequired(false))
+    .addStringOption(o => o.setName('thread_id').setDescription('Optional: exact thread ID instead of a channel').setRequired(false)),
+  new SlashCommandBuilder().setName('rplist').setDescription('Staff: view Pip’s monitored sources and settings.'),
+  new SlashCommandBuilder().setName('rphours').setDescription('Admin: set the RP audit lookback period.')
+    .addIntegerOption(o => o.setName('hours').setDescription('1 to 336 hours; 168 = one week').setMinValue(1).setMaxValue(336).setRequired(true)),
+  new SlashCommandBuilder().setName('rplogchannel').setDescription('Admin: set the private staff audit log channel.')
+    .addChannelOption(o => o.setName('channel').setDescription('Staff-only text channel').setRequired(true)),
+  new SlashCommandBuilder().setName('rpcheckchannel').setDescription('Admin: choose where members submit RP checks.')
+    .addChannelOption(o => o.setName('channel').setDescription('Check-in text channel').setRequired(true)),
+  new SlashCommandBuilder().setName('rphealth').setDescription('Staff: verify Pip’s settings storage on Railway.'),
+  new SlashCommandBuilder().setName('tupperlogchannel').setDescription('Admin: set the private Tupperbox proxy-ownership log channel.')
+    .addChannelOption(o => o.setName('channel').setDescription('Channel used by Tupperbox official proxy logs').setRequired(true)),
+  new SlashCommandBuilder().setName('tupperdiagnose').setDescription('Staff: check whether Pip can read and attribute Tupperbox logs.'),
+  new SlashCommandBuilder().setName('cmd').setDescription('Open Pip’s interactive command directory.')
+    .addSubcommand(o => o.setName('list').setDescription('View the complete command directory.'))
+    .addSubcommand(o => o.setName('info').setDescription('Learn about Pip and its audit reports.'))
+    .addSubcommand(o => o.setName('setup').setDescription('Read the server setup guide.')),
+  new SlashCommandBuilder().setName('rpchart').setDescription('Staff: view and update the RP check-in and activity chart.')
+    .addSubcommand(o => o.setName('view').setDescription('View the RP activity and check-in chart.')
+      .addIntegerOption(p => p.setName('page').setDescription('Chart page (15 members per page)').setMinValue(1).setRequired(false)))
+    .addSubcommand(o => o.setName('refresh').setDescription('Scan monitored RP sources and refresh the chart.'))
+    .addSubcommand(o => o.setName('post').setDescription('Post or update the chart in the private staff log.'))
+    .addSubcommand(o => o.setName('track').setDescription('Include a member on the chart even if they have no activity.')
+      .addUserOption(p => p.setName('member').setDescription('Server member to track').setRequired(true)))
+    .addSubcommand(o => o.setName('untrack').setDescription('Stop manually tracking a member on the chart.')
+      .addUserOption(p => p.setName('member').setDescription('Member to stop tracking').setRequired(true))),
+  new SlashCommandBuilder().setName('ping').setDescription('Check whether Pip is online and responsive.'),
+];
+
+async function registerGuildCommands(guild) {
+  try {
+    // Replace only Pip’s guild-level command list. This does not change bot files,
+    // configuration, permissions, token, or posted audit reports.
+    await guild.commands.set(SLASH_COMMANDS.map(command => command.toJSON()));
+    console.log(`Published ${SLASH_COMMANDS.length} slash-command groups to ${guild.name} (${guild.id})`);
+  } catch (error) {
+    console.error(`Failed publishing slash commands in ${guild.id}:`, error);
+  }
+}
+
+function helpButtons(view = 'list') {
+  const tabs = [
+    ['list', 'All commands'], ['info', 'About Pip'], ['setup', 'Setup guide'],
+  ];
+  return [new ActionRowBuilder().addComponents(...tabs.map(([id, label]) =>
+    new ButtonBuilder().setCustomId(`pip:cmd:${id}`).setLabel(label)
+      .setStyle(view === id ? ButtonStyle.Primary : ButtonStyle.Secondary)))];
+}
+
+function helpEmbed(view = 'list') {
+  const embed = new EmbedBuilder().setColor(0x8b79db).setFooter({ text: 'Pip • RP activity audits • /cmd list' });
+  if (view === 'info') {
+    return embed.setTitle('🤖 About Pip')
+      .setDescription('Pip checks RP activity across configured text channels, public threads, and accessible forum posts. Audit reports are sent to a designated private staff channel.')
+      .addFields(
+        { name: '🔎 Message-level auditing', value: 'Reports group activity by channel/post and link directly to each original message. Pip only counts accessible activity inside the selected time window.' },
+        { name: '✅ Activity check', value: '`/rpcheck` confirms privately. The only `!` command, `!rpcheck`, reacts ✅ when the audit is posted.' },
+        { name: '🔐 Access', value: 'Members can submit checks. Staff can review audits. Server managers control the bot’s configuration.' },
+        { name: '📚 Explore commands', value: 'Select **All commands** or **Setup guide** below.' },
+      );
+  }
+  if (view === 'setup') {
+    return embed.setTitle('🛠️ Pip • Quick Setup')
+      .setDescription('Use these commands in your Discord server. You must have **Manage Server** permission to configure Pip.')
+      .addFields(
+        { name: '1 • Private log', value: '`/rplogchannel channel:#rp-audit-logs`\nRestrict that channel to your staff.' },
+        { name: '2 • Check-in channel', value: '`/rpcheckchannel channel:#activity-check`' },
+        { name: '3 • Add RP sources', value: '`/rpadd channel:#roleplay-forum`\n`/rpadd channel:#roleplay-chat`\nOr use `thread_id` for a specific thread.' },
+        { name: '4 • Set audit window', value: '`/rphours hours:168` — 7 days' },
+        { name: '5 • Verify and test', value: '`/rplist` · `/rphealth` · `/rpcheck`' },
+        { name: '6 • Member chart', value: '`/rpchart refresh` scans all monitored RP sources. `/rpchart view` shows check-ins vs RP activity; `/rpchart post` maintains a staff-only dashboard. Use `/rpchart track` to include members with neither.' },
+        { name: '7 • Tupperbox RP', value: 'First run `tul!cfg log #tupper-logs` with Tupperbox, then `/tupperlogchannel channel:#tupper-logs` with Pip. Pip credits only proxy messages verified against the official log.' },
+        { name: 'Important for Railway', value: 'Attach a persistent Volume mounted at `/data` so RP channel settings survive redeploys.' },
+      );
+  }
+  return embed.setTitle('📚 Pip • Command Directory')
+    .setDescription('Use slash commands for setup, staff tools, and reports. The only remaining `!` command is **`!rpcheck`**.')
+    .addFields(
+      { name: '🌱 Members', value: '`/rpcheck` or `!rpcheck` — Submit your own RP activity check\n`/cmd list` — Show this help menu\n`/cmd info` — About Pip\n`/ping` — Check whether Pip is online' },
+      { name: '🛡️ Staff', value: '`/rplog member:@user` — Audit a member\n`/rpchart view` — Check-ins vs RP chart\n`/rpchart refresh` — Rescan recent activity\n`/rpchart post` — Update staff dashboard\n`/rplist` — View monitored sources\n`/rphealth` — Check persistent storage' },
+      { name: '⚙️ Server managers', value: '`/rpadd` — Add a channel, forum, or thread\n`/rpremove` — Remove monitored source\n`/rphours` — Set audit hours\n`/rplogchannel` — Set staff audit destination\n`/rpcheckchannel` — Set check-in channel\n`/tupperlogchannel` — Set official Tupperbox log source\n`/tupperdiagnose` — Diagnose log matching\n`/rpchart track` / `/rpchart untrack` — Manage chart roster' },
+      { name: '💡 Setup walkthrough', value: 'Use `/cmd setup` or select the **Setup guide** button below.' },
+    );
+}
+
+
+// =========================================================================
+// 11 — DISCORD EVENT HANDLERS AND STARTUP
+// =========================================================================
 client.once(Events.ClientReady, async readyClient => {
   console.log(`Logged in as ${readyClient.user.tag}`);
   await Promise.allSettled([...readyClient.guilds.cache.values()].map(registerGuildCommands));
@@ -969,10 +1147,8 @@ client.on(Events.InteractionCreate, async interaction => {
       }
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       if (action === 'refresh') {
-        // Don't let the complete-source scan interleave with long multi-page staff audits.
-        const job = auditQueue.then(() => refreshActivityChart(interaction.guild));
-        auditQueue = job.catch(() => {});
-        const result = await job;
+        // Bounded concurrency; scans no longer wait for someone else's report pages.
+        const result = await withAuditSlot(() => refreshActivityChart(interaction.guild));
         let dashboardNote = '';
         if (chartSettings(interaction.guild.id).dashboard?.messageId) {
           try { await updateChartDashboard(interaction.guild); }
@@ -1110,17 +1286,38 @@ client.on(Events.InteractionCreate, async interaction => {
 
 // The ONLY supported prefix command is !rpcheck. Everything else uses `/`.
 client.on(Events.MessageCreate, async message => {
-  if (!message.guild || message.author.bot || message.content.trim().toLowerCase() !== '!rpcheck') return;
+  if (!message.guild) return;
+  invalidateChannelCache(message.channelId);
+  if (message.channelId === settings(message.guild.id).tupperLogChannel) {
+    tupperOwnerCache.delete(message.guild.id);
+    // A new ownership log can reattribute messages already present in recent scans.
+    channelScanCache.clear();
+  }
+  if (message.author.bot || message.content.trim().toLowerCase() !== '!rpcheck') return;
   try {
     const cfg = settings(message.guild.id);
     if (cfg.checkChannel && message.channelId !== cfg.checkChannel) {
       return reply(message, `Use <#${cfg.checkChannel}> to submit your RP check.`);
     }
+    // Show that Pip received the check immediately, even if a long scan is queued.
+    // ✅ is still reserved for a successfully published staff audit.
+    await message.react('⏳').catch(() => {});
     enqueueAudit(message, message.author);
   } catch (error) {
     console.error('!rpcheck failed:', error);
     await reply(message, 'Pip could not process the RP check.').catch(() => {});
   }
+});
+
+client.on(Events.MessageDelete, message => {
+  invalidateChannelCache(message.channelId);
+  if (message.guild && message.channelId === settings(message.guild.id).tupperLogChannel) {
+    tupperOwnerCache.delete(message.guild.id);
+    channelScanCache.clear();
+  }
+});
+client.on(Events.MessageUpdate, (_oldMessage, message) => {
+  invalidateChannelCache(message.channelId);
 });
 
 client.login(TOKEN);
