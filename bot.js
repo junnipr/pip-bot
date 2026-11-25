@@ -3,7 +3,7 @@
 // 01 — ENVIRONMENT, BOT CLIENT, AND TUNABLE LIMITS
 // =========================================================================
 /**
- * Pip v2.0 — automatic RP chart roster (compatible with previous Pip settings).
+ * Pip v2.1 — complete staff-visible chart snapshots (compatible with v2.0).
  *
  * Entrypoint: bot.js (single-file, drop-in replacement for GitHub/Railway).
  * Member commands: !rpcheck and /rpcheck. All other prefix commands are disabled.
@@ -19,7 +19,7 @@
  *  06. RP scanning and Discord message utilities
  *  07. Chart collection and rendering
  *  08. Audit report formatting and delivery
- *  09. Audit job queue and background dashboard updates
+ *  09. Audit job queue and immutable chart snapshots
  *  10. Slash commands and help embeds
  *  11. Discord events and startup
  */
@@ -234,7 +234,7 @@ function memberJoinedChart(member) {
   if (chart.trackedIds.includes(member.id)) return;
   chart.trackedIds.push(member.id);
   saveChart();
-  scheduleDashboardUpdate(member.guild);
+  // Posted charts are immutable snapshots; run /rpchart post for a new shared copy.
 }
 
 function memberLeftChart(member) {
@@ -250,7 +250,7 @@ function memberLeftChart(member) {
   delete chart.activity[member.id];
   if (before !== chart.trackedIds.length) {
     saveChart();
-    scheduleDashboardUpdate(member.guild);
+    // Posted charts are immutable snapshots; run /rpchart post for a new shared copy.
   }
 }
 
@@ -275,7 +275,7 @@ async function syncChartRoster(guild) {
     chart.trackedIds = [...roster].sort();
     chart.rosterSyncedAt = Date.now();
     saveChart();
-    scheduleDashboardUpdate(guild);
+    // Previous staff chart posts are never edited.
     console.log(`Pip roster: synchronized ${roster.size} human members in ${guild.name} (${guild.id})`);
     return { members: roster.size, at: chart.rosterSyncedAt };
   })();
@@ -600,7 +600,7 @@ async function scanChildThreads(parent, userId, cutoff, owners = new Map()) {
 
 
 // =========================================================================
-// 07 — AUTOMATIC MEMBER ROSTER, CHART REFRESH, AND DASHBOARD
+// 07 — AUTOMATIC ROSTER, CHART REFRESH, AND SHARED SNAPSHOTS
 // =========================================================================
 function cleanNick(name) {
   return truncate(String(name || 'Unknown member').replace(/[\r\n`*_~|<>]/g, ' ').replace(/@everyone|@here/gi, '[mention]'), 54);
@@ -743,30 +743,78 @@ async function buildChartEmbed(guild, pageNumber = 1) {
   return { embed, page, totalPages, tracked: rows.length };
 }
 
-async function updateChartDashboard(guild) {
+// Each /rpchart post creates a NEW, staff-visible snapshot covering every page.
+// Discord allows <= 10 embeds / message and <= 6,000 characters total across
+// all embeds attached to a message. Use a conservative 4-page maximum and
+// pack by actual embed text length. For larger servers, send continuation
+// messages in the same private staff channel.
+function chartEmbedLength(embed) {
+  const data = typeof embed.toJSON === 'function' ? embed.toJSON() : (embed.v || embed);
+  return (data.title || '').length + (data.description || '').length +
+    (data.footer?.text || '').length + (data.author?.name || '').length +
+    (data.fields || []).reduce((sum, field) => sum + (field.name || '').length + (field.value || '').length, 0);
+}
+
+async function postChartSnapshot(guild) {
   const cfg = settings(guild.id);
   if (!cfg.logChannel) throw new Error('Set /rplogchannel before posting the chart.');
   const channel = await guild.channels.fetch(cfg.logChannel).catch(() => null);
   if (!channel?.isTextBased?.() || !channel.send) throw new Error('Cannot access staff log channel.');
-  const chart = chartSettings(guild.id);
-  const { embed, totalPages } = await buildChartEmbed(guild, 1);
-  const payload = {
-    content: `PIP RP CHART | ${guild.id} | Staff dashboard${totalPages > 1 ? ` (page 1/${totalPages}; use /rpchart view for remaining pages)` : ''}`,
-    embeds: [embed], allowedMentions: { parse: [] },
-  };
-  if (chart.dashboard?.channelId === channel.id && chart.dashboard?.messageId) {
-    const previous = await channel.messages.fetch(chart.dashboard.messageId).catch(() => null);
-    if (previous) {
-      await previous.edit(payload);
-      return previous;
+
+  // Capture a snapshot label once. Chart data is the latest saved check-ins and
+  // activity scan; /rpchart post does not perform an expensive RP scan itself.
+  const timestamp = Math.floor(Date.now() / 1000);
+  const first = await buildChartEmbed(guild, 1);
+  const pages = [first.embed];
+  for (let page = 2; page <= first.totalPages; page++) {
+    pages.push((await buildChartEmbed(guild, page)).embed);
+  }
+
+  const batches = [];
+  let group = [];
+  let chars = 0;
+  let firstPageInGroup = 1;
+  const maxEmbedsPerMessage = 4;
+  const maxEmbedCharsPerMessage = 5700;
+  for (let i = 0; i < pages.length; i++) {
+    const embed = pages[i];
+    const size = chartEmbedLength(embed);
+    if (size > 6000) throw new Error(`Chart page ${i + 1} exceeds Discord embed limits.`);
+    if (group.length && (group.length >= maxEmbedsPerMessage || chars + size > maxEmbedCharsPerMessage)) {
+      batches.push({ firstPage: firstPageInGroup, lastPage: i, embeds: group });
+      group = [];
+      chars = 0;
+      firstPageInGroup = i + 1;
+    }
+    group.push(embed);
+    chars += size;
+  }
+  if (group.length) batches.push({ firstPage: firstPageInGroup, lastPage: pages.length, embeds: group });
+
+  // No edit, fetch or overwrite of a previously posted chart. Every invocation
+  // creates an independent record, visible to everyone with staff-log access.
+  const posted = [];
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    try {
+      const message = await channel.send({
+        content: `📊 **PIP RP CHART — NEW STAFF SNAPSHOT** | <t:${timestamp}:f>\n` +
+          `**Pages ${batch.firstPage}–${batch.lastPage} of ${pages.length}**` +
+          (batches.length > 1 ? `  •  Part ${i + 1}/${batches.length}` : '') +
+          `  •  Window: **${cfg.hours} hours**`,
+        embeds: batch.embeds,
+        allowedMentions: { parse: [] },
+      });
+      posted.push(message);
+    } catch (error) {
+      // Don't pretend a partial multi-message snapshot is complete. Give staff
+      // the existing first link in the error so they can inspect partial output.
+      const partial = posted[0]?.url ? ` First ${posted.length} part(s): ${posted[0].url}.` : '';
+      throw new Error(`Could not publish all chart pages (${posted.length}/${batches.length} messages sent).${partial} ${error.message}`);
     }
   }
-  const posted = await channel.send(payload);
-  chart.dashboard = { channelId: channel.id, messageId: posted.id };
-  saveChart();
-  return posted;
+  return { firstMessage: posted[0], messageCount: posted.length, pageCount: pages.length };
 }
-
 
 // =========================================================================
 // 08 — AUDIT FORMATTING, WEBHOOK MIRROR, AND STAFF REPORTS
@@ -987,7 +1035,7 @@ async function runAudit(originMessage, targetUser) {
       recordCheckIn(originMessage.guild.id, targetUser.id, found.length);
       // Defer chart updates: 15 fresh nickname lookups + message edit are expensive.
       // Coalesced update runs shortly after the checkmark, not before it.
-      scheduleDashboardUpdate(originMessage.guild);
+      // New check-ins update stored chart data, not any previously posted snapshot.
     } catch (error) {
       console.error('Could not save/update check-in chart:', error);
     }
@@ -1041,15 +1089,8 @@ async function removePendingReaction(message) {
   if (reaction) await reaction.users.remove(client.user.id).catch(() => {});
 }
 
-const dashboardTimers = new Map();
-function scheduleDashboardUpdate(guild) {
-  if (!chartSettings(guild.id).dashboard?.messageId) return;
-  if (dashboardTimers.has(guild.id)) clearTimeout(dashboardTimers.get(guild.id));
-  dashboardTimers.set(guild.id, setTimeout(() => {
-    dashboardTimers.delete(guild.id);
-    updateChartDashboard(guild).catch(error => console.error('Could not refresh chart:', error));
-  }, 1500));
-}
+// /rpchart post creates snapshots on demand. Deliberately do not edit old
+// chart posts after member joins, check-ins, nickname changes or refreshes.
 
 function enqueueAudit(message, user) {
   const task = withAuditSlot(() => runAudit(message, user));
@@ -1097,7 +1138,7 @@ const SLASH_COMMANDS = [
     .addSubcommand(o => o.setName('view').setDescription('View the RP activity and check-in chart.')
       .addIntegerOption(p => p.setName('page').setDescription('Chart page (10 members per page)').setMinValue(1).setRequired(false)))
     .addSubcommand(o => o.setName('refresh').setDescription('Scan monitored RP sources and refresh the chart.'))
-    .addSubcommand(o => o.setName('post').setDescription('Post or update the chart in the private staff log.'))
+    .addSubcommand(o => o.setName('post').setDescription('Post a new full chart snapshot, with every page visible to staff.'))
     .addSubcommand(o => o.setName('sync').setDescription('Manager: add every current server member to the chart.')),
   new SlashCommandBuilder().setName('ping').setDescription('Check whether Pip is online and responsive.'),
 ];
@@ -1139,7 +1180,7 @@ function helpEmbed(view = 'list') {
     .setDescription('Review individual audits, member activity, and bot health.')
     .addFields(
       { name: '🔎 Member audits', value: '`/rplog member:@user` — Generate an audit with message links\n`/rplist` — View monitored RP locations' },
-      { name: '📊 Activity chart', value: '`/rpchart view` — Everyone in the server, paged\n`/rpchart refresh` — Rescan recent activity\n`/rpchart post` — Update the staff dashboard\n`/rpchart sync` — Rebuild the member roster' },
+      { name: '📊 Activity chart', value: '`/rpchart view` — Everyone in the server, paged\n`/rpchart refresh` — Rescan recent activity\n`/rpchart post` — Publish all pages for staff\n`/rpchart sync` — Rebuild the member roster' },
       { name: '🎭 Tupperbox + diagnostics', value: '`/tupperdiagnose` — Verify Tupperbox logs\n`/rphealth` — Check stored settings and Railway volume' },
       { name: '⚙️ Server managers only', value: '`/rpadd` / `/rpremove` — Monitored sources\n`/rphours` — Audit window\n`/rplogchannel` / `/rpcheckchannel` — Destinations\n`/tupperlogchannel` — Ownership log\n`/rpchart sync` — Sync all existing members' },
     );
@@ -1195,7 +1236,8 @@ client.on(Events.GuildMemberAdd, member => memberJoinedChart(member));
 client.on(Events.GuildMemberRemove, member => memberLeftChart(member));
 client.on(Events.GuildMemberUpdate, (oldMember, newMember) => {
   // Only repaint after a display-name change, not every unrelated role update.
-  if (oldMember.displayName !== newMember.displayName) scheduleDashboardUpdate(newMember.guild);
+  // Nickname changes show up in the next /rpchart view or /rpchart post.
+  // Previously posted snapshots stay unchanged for the staff audit trail.
 });
 
 client.on(Events.InteractionCreate, async interaction => {
@@ -1260,16 +1302,11 @@ client.on(Events.InteractionCreate, async interaction => {
       if (action === 'refresh') {
         // Bounded concurrency; scans no longer wait for someone else's report pages.
         const result = await withAuditSlot(() => refreshActivityChart(interaction.guild));
-        let dashboardNote = '';
-        if (chartSettings(interaction.guild.id).dashboard?.messageId) {
-          try { await updateChartDashboard(interaction.guild); }
-          catch (error) { console.error('Cannot update dashboard:', error); dashboardNote = '\n⚠️ Staff dashboard could not be updated.'; }
-        }
-        return interaction.editReply({ content: `✅ RP chart refreshed: **${result.members}** members with RP activity and **${result.messages}** messages found. ${result.warnings.length ? `⚠️ ${result.warnings.length} scan limitation(s); results may be incomplete.` : 'Scan completed.'}${dashboardNote}\nUse **/rpchart view** to inspect results.`, allowedMentions: { parse: [] } });
+        return interaction.editReply({ content: `✅ RP chart refreshed: **${result.members}** members with RP activity and **${result.messages}** messages found. ${result.warnings.length ? `⚠️ ${result.warnings.length} scan limitation(s); results may be incomplete.` : 'Scan completed.'}\nRun **/rpchart post** to publish a new shared snapshot containing every page. (Existing posts stay unchanged.)`, allowedMentions: { parse: [] } });
       }
       if (action === 'post') {
-        const message = await updateChartDashboard(interaction.guild);
-        return interaction.editReply({ content: `✅ Staff chart is available: ${message.url}\nIt updates after successful member RP checks. Run **/rpchart refresh** to rescan RP activity from everyone.`, allowedMentions: { parse: [] } });
+        const snapshot = await postChartSnapshot(interaction.guild);
+        return interaction.editReply({ content: `✅ Posted a **new staff-visible RP chart snapshot** with **${snapshot.pageCount} page(s)** across **${snapshot.messageCount} Discord message(s)** in <#${cfg.logChannel}>.\n**Open the first post:** ${snapshot.firstMessage.url}\nAll pages are visible in the staff log. Older chart posts remain unchanged. Use **/rpchart refresh** before posting when you need fresh RP activity counts.`, allowedMentions: { parse: [] } });
       }
       const page = interaction.options.getInteger('page') || 1;
       const result = await buildChartEmbed(interaction.guild, page);
