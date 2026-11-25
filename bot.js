@@ -1,5 +1,5 @@
 /**
- * Pip v1.5 - discord.js 14
+ * Pip v1.6 - discord.js 14
  * Members use !rpcheck or /rpcheck in the configured check channel. All other commands use /.
  * The bot audits recent messages in configured RP text, thread, and forum channels, sends a staff log,
  * and reacts ✅ once the report has been sent.
@@ -20,6 +20,7 @@ const {
   ButtonBuilder,
   ButtonStyle,
   MessageFlags,
+  WebhookClient,
 } = require('discord.js');
 
 const TOKEN = process.env.DISCORD_TOKEN;
@@ -36,6 +37,17 @@ const LEGACY_CONFIG_PATH = path.join(__dirname, 'rpcheck-config.json');
 const MAX_PAGES_PER_CHANNEL = 50; // 5,000 recent messages per text channel or forum post
 const MAX_THREADS_PER_PARENT = 300;
 const MAX_ARCHIVED_THREAD_PAGES = 5;
+const TUPPERBOX_BOT_ID = process.env.PIP_TUPPERBOX_BOT_ID || '431544605209788416';
+const AUDIT_WEBHOOK_URL = process.env.PIP_AUDIT_WEBHOOK_URL || '';
+// Must specify a single guild to prevent leaking audits from other servers.
+const AUDIT_WEBHOOK_GUILD_ID = process.env.PIP_AUDIT_WEBHOOK_GUILD_ID || '';
+const mirrorWebhook = AUDIT_WEBHOOK_URL && /^https:\/\/(discord(?:app)?\.com)\/api\/webhooks\/\d+\/[^\s]+$/.test(AUDIT_WEBHOOK_URL)
+  && /^\d{17,22}$/.test(AUDIT_WEBHOOK_GUILD_ID)
+  ? new WebhookClient({ url: AUDIT_WEBHOOK_URL }) : null;
+if (AUDIT_WEBHOOK_URL && !mirrorWebhook) {
+  console.warn('Pip audit webhook DISABLED: set valid PIP_AUDIT_WEBHOOK_URL and PIP_AUDIT_WEBHOOK_GUILD_ID.');
+}
+
 
 if (!TOKEN) {
   console.error('Missing DISCORD_TOKEN in .env');
@@ -70,6 +82,8 @@ const SLASH_COMMANDS = [
   new SlashCommandBuilder().setName('rpcheckchannel').setDescription('Admin: choose where members submit RP checks.')
     .addChannelOption(o => o.setName('channel').setDescription('Check-in text channel').setRequired(true)),
   new SlashCommandBuilder().setName('rphealth').setDescription('Staff: verify Pip’s settings storage on Railway.'),
+  new SlashCommandBuilder().setName('tupperlogchannel').setDescription('Admin: set the private Tupperbox proxy-ownership log channel.')
+    .addChannelOption(o => o.setName('channel').setDescription('Channel used by Tupperbox official proxy logs').setRequired(true)),
   new SlashCommandBuilder().setName('cmd').setDescription('Open Pip’s interactive command directory.')
     .addSubcommand(o => o.setName('list').setDescription('View the complete command directory.'))
     .addSubcommand(o => o.setName('info').setDescription('Learn about Pip and its audit reports.'))
@@ -128,6 +142,7 @@ function helpEmbed(view = 'list') {
         { name: '4 • Set audit window', value: '`/rphours hours:168` — 7 days' },
         { name: '5 • Verify and test', value: '`/rplist` · `/rphealth` · `/rpcheck`' },
         { name: '6 • Member chart', value: '`/rpchart refresh` scans all monitored RP sources. `/rpchart view` shows check-ins vs RP activity; `/rpchart post` maintains a staff-only dashboard. Use `/rpchart track` to include members with neither.' },
+        { name: '7 • Tupperbox RP', value: 'First run `tul!cfg log #tupper-logs` with Tupperbox, then `/tupperlogchannel channel:#tupper-logs` with Pip. Pip credits only proxy messages verified against the official log.' },
         { name: 'Important for Railway', value: 'Attach a persistent Volume mounted at `/data` so RP channel settings survive redeploys.' },
       );
   }
@@ -136,7 +151,7 @@ function helpEmbed(view = 'list') {
     .addFields(
       { name: '🌱 Members', value: '`/rpcheck` or `!rpcheck` — Submit your own RP activity check\n`/cmd list` — Show this help menu\n`/cmd info` — About Pip\n`/ping` — Check whether Pip is online' },
       { name: '🛡️ Staff', value: '`/rplog member:@user` — Audit a member\n`/rpchart view` — Check-ins vs RP chart\n`/rpchart refresh` — Rescan recent activity\n`/rpchart post` — Update staff dashboard\n`/rplist` — View monitored sources\n`/rphealth` — Check persistent storage' },
-      { name: '⚙️ Server managers', value: '`/rpadd` — Add a channel, forum, or thread\n`/rpremove` — Remove monitored source\n`/rphours` — Set audit hours\n`/rplogchannel` — Set staff audit destination\n`/rpcheckchannel` — Set check-in channel\n`/rpchart track` / `/rpchart untrack` — Manage chart roster' },
+      { name: '⚙️ Server managers', value: '`/rpadd` — Add a channel, forum, or thread\n`/rpremove` — Remove monitored source\n`/rphours` — Set audit hours\n`/rplogchannel` — Set staff audit destination\n`/rpcheckchannel` — Set check-in channel\n`/tupperlogchannel` — Set official Tupperbox log source\n`/rpchart track` / `/rpchart untrack` — Manage chart roster' },
       { name: '💡 Setup walkthrough', value: 'Use `/cmd setup` or select the **Setup guide** button below.' },
     );
 }
@@ -193,8 +208,9 @@ if (process.env.RAILWAY_PROJECT_ID && !process.env.RAILWAY_VOLUME_MOUNT_PATH && 
 
 function settings(guildId) {
   if (!db[guildId]) {
-    db[guildId] = { rpChannels: [], logChannel: null, checkChannel: null, hours: 48 };
+    db[guildId] = { rpChannels: [], logChannel: null, checkChannel: null, tupperLogChannel: null, hours: 48 };
   }
+  if (!Object.hasOwn(db[guildId], 'tupperLogChannel')) db[guildId].tupperLogChannel = null;
   return db[guildId];
 }
 
@@ -286,7 +302,7 @@ async function refreshActivityChart(guild) {
   if (!cfg.rpChannels.length) throw new Error('No RP channels configured. Use /rpadd first.');
   const cutoff = Date.now() - cfg.hours * 60 * 60 * 1000;
   const uniqueMessages = new Map();
-  const warnings = [];
+  const { owners, warnings } = await getTupperOwners(guild, cutoff);
   for (const id of cfg.rpChannels) {
     const channel = await guild.channels.fetch(id).catch(() => null);
     if (!isSupportedMonitorChannel(channel)) {
@@ -295,16 +311,16 @@ async function refreshActivityChart(guild) {
     }
     try {
       if (channel.type === ChannelType.GuildForum) {
-        const result = await scanChildThreads(channel, null, cutoff);
+        const result = await scanChildThreads(channel, null, cutoff, owners);
         result.matches.forEach(m => uniqueMessages.set(m.id, m));
         warnings.push(...result.warnings);
       } else if (channel.isThread()) {
-        const result = await scanChannel(channel, null, cutoff);
+        const result = await scanChannel(channel, null, cutoff, owners);
         result.matches.forEach(m => uniqueMessages.set(m.id, m));
         if (result.truncated) warnings.push(`${channel.name}: scan limit reached`);
       } else {
-        const own = await scanChannel(channel, null, cutoff);
-        const children = await scanChildThreads(channel, null, cutoff);
+        const own = await scanChannel(channel, null, cutoff, owners);
+        const children = await scanChildThreads(channel, null, cutoff, owners);
         [...own.matches, ...children.matches].forEach(m => uniqueMessages.set(m.id, m));
         if (own.truncated) warnings.push(`${channel.name}: scan limit reached`);
         warnings.push(...children.warnings);
@@ -318,7 +334,8 @@ async function refreshActivityChart(guild) {
   const at = Date.now();
   const activity = {};
   for (const m of uniqueMessages.values()) {
-    const id = m.author.id;
+    const id = m._pipOwnerId;
+    if (!id) continue;
     if (!activity[id]) activity[id] = { count: 0, scannedAt: at, hours: cfg.hours };
     activity[id].count++;
   }
@@ -425,8 +442,80 @@ async function reply(message, content) {
   return message.reply({ content, allowedMentions: { repliedUser: false, parse: [] } });
 }
 
+// Tupperbox logs are the source of truth for proxy-message ownership.
+// The visible Tupper name alone is NOT enough to identify a Discord member.
+// Tupperbox emits a staff log embed with "Registered by" and the original
+// Discord message link / message ID. Ignore unverified proxies rather than guessing.
+function parseTupperLogEmbed(embed, guildId) {
+  const fields = embed?.fields || [];
+  const named = label => fields.find(f => String(f.name || '').toLowerCase().includes(label))?.value || '';
+  const registered = String(named('registered by'));
+  const ownerMatch = registered.match(/<@!?(\d{15,22})>/) || registered.match(/\((\d{15,22})\)/);
+  if (!ownerMatch) return null;
+  const urlText = String(named('original message'));
+  const urlMatch = urlText.match(/https?:\/\/(?:canary\.|ptb\.)?discord(?:app)?\.com\/channels\/(\d+)\/(\d+)\/(\d+)/);
+  if (urlMatch && urlMatch[1] !== guildId) return null;
+  const idText = [embed?.footer?.text, named('message id')].filter(Boolean).join(' ');
+  const idMatch = idText.match(/message\s*id[^\d]*(\d{15,22})/i) || idText.match(/^(\d{15,22})$/);
+  const messageId = urlMatch?.[3] || idMatch?.[1];
+  if (!messageId) return null;
+  if (urlMatch && idMatch && urlMatch[3] !== idMatch[1]) return null;
+  return { messageId, ownerId: ownerMatch[1], tupperName: String(embed?.title || '').slice(0, 80) };
+}
+
+async function getTupperOwners(guild, cutoff) {
+  const cfg = settings(guild.id);
+  const owners = new Map();
+  const warnings = [];
+  if (!cfg.tupperLogChannel) return { owners, warnings };
+  const channel = await guild.channels.fetch(cfg.tupperLogChannel).catch(() => null);
+  if (!isSupportedChannel(channel)) {
+    warnings.push('Tupperbox log channel missing or inaccessible; Tupper RP cannot be credited.');
+    return { owners, warnings };
+  }
+  let before;
+  for (let page = 0; page < MAX_PAGES_PER_CHANNEL; page++) {
+    try {
+      const batch = await channel.messages.fetch({ limit: 100, cache: false, ...(before ? { before } : {}) });
+      if (!batch.size) break;
+      const messages = [...batch.values()];
+      let older = false;
+      for (const m of messages) {
+        if (m.createdTimestamp < cutoff) { older = true; break; }
+        if (m.author?.id !== TUPPERBOX_BOT_ID) continue;
+        for (const e of m.embeds || []) {
+          const ownership = parseTupperLogEmbed(e, guild.id);
+          if (ownership) owners.set(ownership.messageId, ownership);
+        }
+      }
+      if (older || batch.size < 100) break;
+      before = messages[messages.length - 1].id;
+      if (page === MAX_PAGES_PER_CHANNEL - 1) warnings.push('Tupperbox log reached 5,000-message scan cap; some proxy messages may be missing.');
+    } catch (err) {
+      console.error('Cannot read Tupperbox logs:', err);
+      warnings.push('Unable to read Tupperbox log history; Tupper messages may be undercounted.');
+      break;
+    }
+  }
+  return { owners, warnings };
+}
+
+async function sendAuditToStaff(logChannel, payload, guildId) {
+  const posted = await logChannel.send(payload);
+  if (mirrorWebhook && guildId === AUDIT_WEBHOOK_GUILD_ID) {
+    try {
+      // Mirror the same summary and direct-message links to a second staff-only
+      // channel. Webhook URL is a secret stored in Railway Variables, not Discord.
+      await mirrorWebhook.send({ ...payload, username: 'Pip RP Audit', allowedMentions: { parse: [] } });
+    } catch (error) {
+      console.error('Could not mirror staff audit to the configured webhook:', error);
+    }
+  }
+  return posted;
+}
+
 // Read a configurable time window, paging backward until before the cutoff.
-async function scanChannel(channel, userId, cutoff) {
+async function scanChannel(channel, userId, cutoff, owners = new Map()) {
   let before;
   let truncated = false;
   const matches = [];
@@ -444,7 +533,11 @@ async function scanChannel(channel, userId, cutoff) {
         foundOldMessage = true;
         break;
       }
-      if ((!userId || m.author.id === userId) && !m.author.bot) {
+      const attribution = m.webhookId ? owners.get(m.id) : null;
+      const ownerId = attribution?.ownerId || (!m.author.bot && !m.webhookId ? m.author.id : null);
+      if (ownerId && (!userId || ownerId === userId)) {
+        m._pipOwnerId = ownerId;
+        m._pipTupperName = attribution ? (attribution.tupperName || m.author.username) : null;
         matches.push(m);
       }
     }
@@ -512,13 +605,13 @@ async function collectPublicThreads(parent, cutoff) {
   return { threads: [...threads.values()], warnings };
 }
 
-async function scanChildThreads(parent, userId, cutoff) {
+async function scanChildThreads(parent, userId, cutoff, owners = new Map()) {
   const { threads, warnings } = await collectPublicThreads(parent, cutoff);
   const matches = [];
   let searchedThreads = 0;
   for (const thread of threads) {
     try {
-      const result = await scanChannel(thread, userId, cutoff);
+      const result = await scanChannel(thread, userId, cutoff, owners);
       searchedThreads++;
       matches.push(...result.matches);
       if (result.truncated) warnings.push(`#${parent.name} / ${thread.name}: reached 5,000-message cap`);
@@ -589,7 +682,7 @@ async function runAudit(originMessage, targetUser) {
 
   const cutoff = Date.now() - cfg.hours * 60 * 60 * 1000;
   const foundById = new Map(); // avoids duplicate results when both a parent and its thread are configured
-  const warnings = [];
+  const { owners, warnings } = await getTupperOwners(originMessage.guild, cutoff);
   let scannedSources = 0;
   let scannedPosts = 0;
 
@@ -602,17 +695,17 @@ async function runAudit(originMessage, targetUser) {
     scannedSources++;
     try {
       if (channel.type === ChannelType.GuildForum) {
-        const result = await scanChildThreads(channel, targetUser.id, cutoff);
+        const result = await scanChildThreads(channel, targetUser.id, cutoff, owners);
         scannedPosts += result.searchedThreads;
         for (const m of result.matches) foundById.set(m.id, m);
         warnings.push(...result.warnings);
       } else if (channel.isThread()) {
-        const result = await scanChannel(channel, targetUser.id, cutoff);
+        const result = await scanChannel(channel, targetUser.id, cutoff, owners);
         for (const m of result.matches) foundById.set(m.id, m);
         if (result.truncated) warnings.push(`${channel.name}: reached 5,000-message scan limit`);
       } else {
-        const own = await scanChannel(channel, targetUser.id, cutoff);
-        const child = await scanChildThreads(channel, targetUser.id, cutoff);
+        const own = await scanChannel(channel, targetUser.id, cutoff, owners);
+        const child = await scanChildThreads(channel, targetUser.id, cutoff, owners);
         scannedPosts += child.searchedThreads;
         for (const m of [...own.matches, ...child.matches]) foundById.set(m.id, m);
         if (own.truncated) warnings.push(`${channel.name}: reached 5,000-message scan limit`);
@@ -635,6 +728,8 @@ async function runAudit(originMessage, targetUser) {
   // Put the most active RP locations first; nothing with zero messages appears.
   const locations = [...byLocation.values()].sort((a, b) =>
     b.messages.length - a.messages.length || b.messages[0].createdTimestamp - a.messages[0].createdTimestamp);
+  const characters = new Map();
+  for (const m of found) if (m._pipTupperName) characters.set(m._pipTupperName, (characters.get(m._pipTupperName) || 0) + 1);
   const time = Math.floor(Date.now() / 1000);
   const liveName = await getLiveServerName(originMessage.guild, targetUser.id);
   const searchableTag = `RP AUDIT | ${liveName} | USER ID: ${targetUser.id}`;
@@ -651,11 +746,17 @@ async function runAudit(originMessage, targetUser) {
       `**Requested by:** ${originMessage.author.username}`,
       `**Period:** Last ${cfg.hours} hours`,
       `**Messages found:** **${found.length}**`,
+      `**Verified Tupper messages:** **${[...characters.values()].reduce((n, x) => n + x, 0)}**`,
       `**Locations with activity:** **${locations.length}**`,
       `**Status:** ${status}`,
       `**Generated:** <t:${time}:f>`,
     ].join('\n'))
     .setFooter({ text: `Pip • ${scannedSources} configured sources checked${scannedPosts ? ` • ${scannedPosts} accessible threads/posts inspected` : ''}` });
+
+  if (characters.size) {
+    const charLines = [...characters.entries()].sort((a,b) => b[1] - a[1]).map(([n,c]) => `• **${c}** — ${truncate(n, 60)}`);
+    summaryEmbed.addFields({ name: '🎭 Tupper characters credited to this member', value: truncate(charLines.join('\n'), 990) });
+  }
 
   if (locations.length) {
     // 1024-character embed field limit. Split summaries into readable lines.
@@ -687,11 +788,11 @@ async function runAudit(originMessage, targetUser) {
   }
 
   // Searchable plain-text heading and visually organized summary embed.
-  await logChannel.send({
+  await sendAuditToStaff(logChannel, {
     content: `${searchableTag}\n${linkToCheck}`,
     embeds: [summaryEmbed],
     allowedMentions: { parse: [] },
-  });
+  }, originMessage.guild.id);
 
   // Message records grouped by actual post/thread/channel. Each original link
   // opens directly on the member's individual message in Discord.
@@ -701,13 +802,14 @@ async function runAudit(originMessage, targetUser) {
     const lines = location.messages.map(m => {
       const stamp = Math.floor(m.createdTimestamp / 1000);
       const link = m.url || `https://discord.com/channels/${originMessage.guild.id}/${m.channelId}/${m.id}`;
-      return `**<t:${stamp}:f>** — ${cleanContent(m)}\n🔗 ${link}\n`;
+      const actor = m._pipTupperName ? `🎭 **${truncate(m._pipTupperName, 75)}** — ` : '';
+      return `${actor}**<t:${stamp}:f>** — ${cleanContent(m)}\n🔗 ${link}\n`;
     });
     const pages = paginateDetails(header, lines);
     for (let i = 0; i < pages.length; i++) {
       // Multi-page records repeat the place + member ID for staff search.
       const suffix = pages.length > 1 ? `\n*${i + 1}/${pages.length} pages for this location*` : '';
-      await logChannel.send({ content: `${pages[i]}${suffix}`, allowedMentions: { parse: [] } });
+      await sendAuditToStaff(logChannel, { content: `${pages[i]}${suffix}`, allowedMentions: { parse: [] } }, originMessage.guild.id);
     }
   }
 
@@ -784,7 +886,7 @@ client.on(Events.InteractionCreate, async interaction => {
       return;
     }
 
-    const staffCommands = ['rplog', 'rplist', 'rphealth', 'rpchart', 'rpadd', 'rpremove', 'rphours', 'rplogchannel', 'rpcheckchannel'];
+    const staffCommands = ['rplog', 'rplist', 'rphealth', 'rpchart', 'rpadd', 'rpremove', 'rphours', 'rplogchannel', 'rpcheckchannel', 'tupperlogchannel'];
     if (!staffCommands.includes(name)) return;
     if (!isInteractionStaff(interaction)) {
       return respondPrivately(interaction, 'This is a staff-only command.');
@@ -846,6 +948,7 @@ client.on(Events.InteractionCreate, async interaction => {
           { name: '📁 Staff log', value: cfg.logChannel ? `<#${cfg.logChannel}>` : 'Not set', inline: true },
           { name: '✅ Check-in channel', value: cfg.checkChannel ? `<#${cfg.checkChannel}>` : 'Any channel', inline: true },
           { name: '🕐 Audit window', value: `${cfg.hours} hours`, inline: true },
+          { name: '🎭 Tupperbox ownership log', value: cfg.tupperLogChannel ? `<#${cfg.tupperLogChannel}>` : 'Not set — Tupper messages cannot be automatically credited', inline: false },
         )
         .setFooter({ text: `${cfg.rpChannels.length} monitored source(s) • Pip` });
       return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
@@ -859,12 +962,23 @@ client.on(Events.InteractionCreate, async interaction => {
           { name: 'Railway Volume', value: attached ? '✅ Attached' : '⚠️ Not detected — chart and settings may reset on redeploy', inline: true },
           { name: 'Sources configured', value: String(cfg.rpChannels.length), inline: true },
           { name: 'Audit window', value: `${cfg.hours} hours`, inline: true },
+          { name: 'Tupperbox log', value: cfg.tupperLogChannel ? `<#${cfg.tupperLogChannel}>` : 'Not configured', inline: true },
+          { name: 'Audit webhook mirror', value: mirrorWebhook && interaction.guild.id === AUDIT_WEBHOOK_GUILD_ID ? 'Configured in Railway' : 'Off', inline: true },
         );
       return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
     }
     // Only users with Manage Server may change persistent configuration.
     if (!isInteractionManager(interaction)) {
       return respondPrivately(interaction, 'You need **Manage Server** to change Pip’s settings.');
+    }
+    if (name === 'tupperlogchannel') {
+      const tupperChannel = interaction.options.getChannel('channel', true);
+      if (!isSupportedChannel(tupperChannel)) return respondPrivately(interaction, 'Choose a normal private text channel for Tupperbox logs.');
+      if (cfg.rpChannels.includes(tupperChannel.id)) return respondPrivately(interaction, 'Tupperbox logging must be separate from monitored RP channels.');
+      if (tupperChannel.id === cfg.logChannel) return respondPrivately(interaction, 'Use a separate Tupperbox log channel, not Pip’s staff audit channel.');
+      cfg.tupperLogChannel = tupperChannel.id;
+      saveSettings();
+      return respondPrivately(interaction, `✅ Pip will cross-reference official Tupperbox proxy logs in <#${tupperChannel.id}>. First enable logging in Tupperbox: \`tul!cfg log #tupper-logs\` (using your actual channel).`);
     }
     if (name === 'rphours') {
       const hours = interaction.options.getInteger('hours', true);
@@ -882,7 +996,7 @@ client.on(Events.InteractionCreate, async interaction => {
       channel = chosen || await interaction.guild.channels.fetch(threadId).catch(() => null);
       if (!isSupportedMonitorChannel(channel)) return respondPrivately(interaction, 'That source must be a text channel, forum, or accessible thread.');
       if (name === 'rpadd') {
-        if (channel.id === cfg.logChannel) return respondPrivately(interaction, 'You cannot monitor the staff audit log channel.');
+        if (channel.id === cfg.logChannel || channel.id === cfg.tupperLogChannel) return respondPrivately(interaction, 'You cannot monitor a staff audit or Tupperbox log channel as RP.');
         if (cfg.rpChannels.includes(channel.id)) return respondPrivately(interaction, 'That source is already monitored.');
         cfg.rpChannels.push(channel.id);
         saveSettings();
