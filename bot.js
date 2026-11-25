@@ -3,7 +3,7 @@
 // 01 — ENVIRONMENT, BOT CLIENT, AND TUNABLE LIMITS
 // =========================================================================
 /**
- * Pip v1.8 — organized edition (compatible with Pip v1.7 settings).
+ * Pip v1.9 — Discord UI edition (compatible with Pip v1.8 settings).
  *
  * Entrypoint: bot.js (single-file, drop-in replacement for GitHub/Railway).
  * Member commands: !rpcheck and /rpcheck. All other prefix commands are disabled.
@@ -601,7 +601,18 @@ async function refreshActivityChart(guild) {
   return { members: Object.keys(activity).length, messages: uniqueMessages.size, warnings };
 }
 
-const CHART_PAGE_SIZE = 15;
+const CHART_PAGE_SIZE = 10;
+// Staff can move between pages from the ephemeral /rpchart view itself.
+// All values are still computed from the existing ID-keyed chart database.
+function chartPageButtons(page, totalPages) {
+  if (totalPages <= 1) return [];
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`pip:chart:${Math.max(1, page - 1)}`)
+      .setLabel('◀ Previous').setStyle(ButtonStyle.Secondary).setDisabled(page <= 1),
+    new ButtonBuilder().setCustomId(`pip:chart:${Math.min(totalPages, page + 1)}`)
+      .setLabel('Next ▶').setStyle(ButtonStyle.Primary).setDisabled(page >= totalPages),
+  )];
+}
 async function buildChartEmbed(guild, pageNumber = 1) {
   const cfg = settings(guild.id);
   const chart = chartSettings(guild.id);
@@ -614,46 +625,42 @@ async function buildChartEmbed(guild, pageNumber = 1) {
     ...checkers,
     ...Object.entries(chart.activity).filter(([, a]) => a?.count > 0 && a.hours === cfg.hours && a.scannedAt >= cutoff).map(([id]) => id),
   ]);
-  // A specific user may have a recent on-demand audit even before a full refresh.
   const hasFreshScan = Boolean(chart.lastRefreshedAt && chart.refreshedForHours === cfg.hours && chart.lastRefreshedAt >= cutoff);
   const rows = [...ids].map(id => {
     const recentScan = chart.activity[id]?.hours === cfg.hours && chart.activity[id]?.scannedAt >= cutoff ? chart.activity[id] : null;
     const rpCount = recentScan?.count ?? (hasFreshScan ? 0 : null);
-    return { id, checked: checkers.has(id), rpCount, scanAt: recentScan?.scannedAt || 0 };
+    return { id, checked: checkers.has(id), rpCount };
   }).sort((a, b) => Number(b.checked) - Number(a.checked) ||
-    Number(b.rpCount > 0) - Number(a.rpCount > 0) || b.rpCount - a.rpCount || a.id.localeCompare(b.id));
+    Number(b.rpCount > 0) - Number(a.rpCount > 0) || (b.rpCount ?? 0) - (a.rpCount ?? 0) || a.id.localeCompare(b.id));
   const totalPages = Math.max(1, Math.ceil(rows.length / CHART_PAGE_SIZE));
   const page = Math.min(Math.max(1, pageNumber), totalPages);
   const items = rows.slice((page - 1) * CHART_PAGE_SIZE, page * CHART_PAGE_SIZE);
   const names = await Promise.all(items.map(item => getLiveServerName(guild, item.id)));
   const lines = items.map((item, i) => {
-    const check = item.checked ? '✅' : '—';
-    const played = item.rpCount === null ? '❔' : item.rpCount > 0 ? '✅' : '—';
-    const quantity = item.rpCount > 0 ? ` · ${item.rpCount} messages` : '';
-    return `${check}  ${played}  **${names[i]}**${quantity}`;
+    const check = item.checked ? '✅' : '➖';
+    const played = item.rpCount === null ? '❔' : item.rpCount > 0 ? '✅' : '➖';
+    const count = item.rpCount > 0 ? ` · **${item.rpCount}** messages` : '';
+    // One member per line; clicking their profile mention is useful for staff.
+    return `${check}  ${played}  **${truncate(names[i].replace(/[\r\n]/g, ' '), 55)}**${count}`;
   });
   const checkedCount = rows.filter(r => r.checked).length;
   const activeCount = rows.filter(r => r.rpCount > 0).length;
   const refreshLine = hasFreshScan
-    ? `<t:${Math.floor(chart.lastRefreshedAt / 1000)}:f> (as-of snapshot)`
-    : 'Not refreshed for this audit window — use `/rpchart refresh`';
+    ? `<t:${Math.floor(chart.lastRefreshedAt / 1000)}:R>`
+    : 'Not refreshed for this window';
   const embed = new EmbedBuilder().setColor(0x8b79db)
-    .setTitle('📊 Pip • RP Check-In & Activity Chart')
-    .setDescription([
-      `**Period:** Last ${cfg.hours} hours`,
-      `**Checked in:** ${checkedCount}   •   **RP observed:** ${activeCount}   •   **Listed:** ${rows.length}`,
-      `**RP scan:** ${refreshLine}`,
-      '',
-      '**Check-in  RP  —  Current in-server name**',
-      ...(lines.length ? lines : ['No entries yet. Run `/rpchart refresh` or `/rpchart track`.']),
-    ].join('\n'))
-    .addFields({ name: 'How it works', value: '✅ = yes · — = no · ❔ = not scanned. Check-in means `/rpcheck` or `!rpcheck` successfully posted an audit. Staff `/rplog` does **not** count as a check-in.' })
-    .setFooter({ text: `Page ${page}/${totalPages} • Pip tracks Discord IDs, so nicknames are looked up when rendered` });
+    .setTitle('📊 Pip | Member Activity')
+    .setDescription('**✅** Yes  •  **➖** No  •  **❔** Needs scan\nColumns: **RP check**  /  **Roleplayed**  /  **Server name**')
+    .addFields(
+      { name: '✅ Checked in', value: String(checkedCount), inline: true },
+      { name: '✍️ Roleplayed', value: String(activeCount), inline: true },
+      { name: '👥 Listed members', value: String(rows.length), inline: true },
+      { name: `Members • Page ${page}/${totalPages}`, value: lines.length ? truncate(lines.join('\n'), 1020) : 'No members listed yet. Use `/rpchart refresh` or `/rpchart track`.' },
+      { name: '📅 Tracking window', value: `Last **${cfg.hours} hours** • RP scan: ${refreshLine}` },
+    )
+    .setFooter({ text: 'Staff only • Nicknames refresh on view • /rpchart refresh rescans RP' });
   if (hasFreshScan && chart.warnings.length) {
-    embed.addFields({ name: '⚠️ Scan limitations', value: `Some sources were incomplete (${chart.warnings.length} issue(s)). Results may undercount RP.` });
-  }
-  if (!chart.trackedIds.length) {
-    embed.addFields({ name: 'Who appears?', value: 'Members with a recorded check-in or observed RP activity. Use `/rpchart track` for members with neither. Pip does not automatically enumerate every server member.' });
+    embed.addFields({ name: '⚠️ Scan limits', value: `${chart.warnings.length} source warning(s) — counts may be incomplete.` });
   }
   return { embed, page, totalPages, tracked: rows.length };
 }
@@ -819,84 +826,77 @@ async function runAudit(originMessage, targetUser) {
     ? `Source check: ${originMessage.url}`
     : `Requested with /${originMessage.commandName} in <#${originMessage.channelId}>`;
 
-  const status = warnings.length ? '⚠️ Partial scan — see notes' : '✅ Scan completed';
+  // Discord-facing audit layout: a compact overview followed by one embed per
+  // actual RP channel / forum post / thread. No empty channel entries are shown.
+  const status = warnings.length ? '⚠️ Some sources incomplete' : '✅ Completed';
+  const tupperCount = [...characters.values()].reduce((n, x) => n + x, 0);
   const summaryEmbed = new EmbedBuilder()
-    .setColor(warnings.length ? 0xe8a23a : 0x667eea)
-    .setTitle(`📋 RP Activity Audit — ${truncate(liveName, 100)}`)
-    .setDescription([
-      `**Member:** ${liveName} (\`${targetUser.id}\`)`,
-      `**Requested by:** ${originMessage.author.username}`,
-      `**Period:** Last ${cfg.hours} hours`,
-      `**Messages found:** **${found.length}**`,
-      `**Verified Tupper messages:** **${[...characters.values()].reduce((n, x) => n + x, 0)}**`,
-      `**Locations with activity:** **${locations.length}**`,
-      `**Status:** ${status}`,
-      `**Generated:** <t:${time}:f>`,
-    ].join('\n'))
-    .setFooter({ text: `Pip • ${scannedSources} configured sources checked${scannedPosts ? ` • ${scannedPosts} accessible threads/posts inspected` : ''}` });
+    .setColor(warnings.length ? 0xe8a23a : 0x8b79db)
+    .setTitle(`📋 RP Audit | ${truncate(liveName, 95)}`)
+    .setDescription(`**Member:** ${truncate(liveName, 65)}\n**User ID:** \`${targetUser.id}\`\n**Requested by:** ${truncate(originMessage.author.username, 60)}\n**Status:** ${status}`)
+    .addFields(
+      { name: '✍️ Messages', value: String(found.length), inline: true },
+      { name: '📍 Active locations', value: String(locations.length), inline: true },
+      { name: '🎭 Tupper replies', value: String(tupperCount), inline: true },
+      { name: '🕒 Audit period', value: `Last **${cfg.hours} hours** • <t:${time}:f>` },
+    )
+    .setFooter({ text: `Pip • ${scannedSources} sources checked • ${scannedPosts} threads/posts visited` });
 
   if (characters.size) {
-    const charLines = [...characters.entries()].sort((a,b) => b[1] - a[1]).map(([n,c]) => `• **${c}** — ${truncate(n, 60)}`);
-    summaryEmbed.addFields({ name: '🎭 Tupper characters credited to this member', value: truncate(charLines.join('\n'), 990) });
+    const charLines = [...characters.entries()].sort((a, b) => b[1] - a[1])
+      .slice(0, 12).map(([n, c]) => `• **${truncate(n.replace(/[\r\n]/g, ' '), 62)}** — ${c}`);
+    summaryEmbed.addFields({ name: '🎭 Credited characters', value: truncate(charLines.join('\n'), 1000) });
   }
-
-  if (locations.length) {
-    // 1024-character embed field limit. Split summaries into readable lines.
-    let groupText = '';
-    let fieldNo = 1;
-    let omitted = 0;
-    for (const entry of locations) {
-      const label = truncate(getLocationLabel(entry.channel), 90).replace(/[\r\n]/g, ' ');
-      const line = `• **${entry.messages.length}** — ${label}\n`;
-      if (groupText.length + line.length > 950) {
-        if (fieldNo <= 4) summaryEmbed.addFields({ name: fieldNo === 1 ? 'Active locations' : 'Active locations (continued)', value: groupText });
-        else omitted += 1;
-        fieldNo++;
-        groupText = '';
-      }
-      groupText += line;
-    }
-    if (groupText) {
-      if (fieldNo <= 4) summaryEmbed.addFields({ name: fieldNo === 1 ? 'Active locations' : 'Active locations (continued)', value: groupText });
-      else omitted++;
-    }
-    if (omitted) summaryEmbed.addFields({ name: 'More active locations', value: 'See the detailed audit messages below.' });
+  if (!locations.length) {
+    summaryEmbed.addFields({ name: 'No RP found', value: 'No messages were detected in the configured sources for this time window.' });
   } else {
-    summaryEmbed.addFields({ name: 'Result', value: 'No RP messages found during the selected window.' });
+    // Only show the busiest active locations in the overview. Detailed pages
+    // below cover every location and link to the exact original messages.
+    const overview = locations.slice(0, 12).map(location => {
+      const first = location.messages[0];
+      const link = first.url || `https://discord.com/channels/${originMessage.guild.id}/${first.channelId}/${first.id}`;
+      return `• **${location.messages.length}** · ${truncate(getLocationLabel(location.channel).replace(/[\r\n]/g, ' '), 66)} · [Open](${link})`;
+    });
+    if (locations.length > 12) overview.push(`…plus ${locations.length - 12} more locations in the detailed records below.`);
+    summaryEmbed.addFields({ name: '📁 Where they roleplayed', value: truncate(overview.join('\n'), 1000) });
   }
-
   if (warnings.length) {
-    summaryEmbed.addFields({ name: 'Scan notes', value: truncate(warnings.map(w => `• ${w}`).join('\n'), 900) });
+    summaryEmbed.addFields({ name: '⚠️ Scan notes', value: truncate(warnings.slice(0, 7).map(w => `• ${w}`).join('\n'), 1000) });
   }
 
-  // Scan jobs run concurrently, but staff messages from each report stay grouped.
   await sendReportTogether(async () => {
-    // Searchable plain-text heading and visually organized summary embed.
+    // Keep the member's permanent user ID as searchable plain message content.
     await sendAuditToStaff(logChannel, {
       content: `${searchableTag}\n${linkToCheck}`,
       embeds: [summaryEmbed],
       allowedMentions: { parse: [] },
     }, originMessage.guild.id);
 
-    // Message records grouped by actual post/thread/channel. Each original link
-    // opens directly on the member's individual message in Discord.
+    // Readable embeds with each link labeled 'Open message', rather than an
+    // uninterrupted wall of raw URLs. At most 7 records per embed page.
+    const PAGE_SIZE = 7;
     for (const location of locations) {
-      const place = getLocationLabel(location.channel);
-      const header = `${searchableTag}\n📍 **${truncate(place, 130)}** — ${location.messages.length} message(s)\n`;
-      const lines = location.messages.map(m => {
-        const stamp = Math.floor(m.createdTimestamp / 1000);
-        const link = m.url || `https://discord.com/channels/${originMessage.guild.id}/${m.channelId}/${m.id}`;
-        const actor = m._pipTupperName ? `🎭 **${truncate(m._pipTupperName, 75)}** — ` : '';
-        return `${actor}**<t:${stamp}:f>** — ${cleanContent(m)}\n🔗 ${link}\n`;
-      });
-      const pages = paginateDetails(header, lines);
-      for (let i = 0; i < pages.length; i++) {
-        // Multi-page records repeat the place + member ID for staff search.
-        const suffix = pages.length > 1 ? `\n*${i + 1}/${pages.length} pages for this location*` : '';
-        await sendAuditToStaff(logChannel, { content: `${pages[i]}${suffix}`, allowedMentions: { parse: [] } }, originMessage.guild.id);
+      const place = truncate(getLocationLabel(location.channel).replace(/[\r\n]/g, ' '), 140);
+      const pageCount = Math.ceil(location.messages.length / PAGE_SIZE);
+      for (let page = 0; page < pageCount; page++) {
+        const messages = location.messages.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+        const sections = messages.map((m, i) => {
+          const stamp = Math.floor(m.createdTimestamp / 1000);
+          const link = m.url || `https://discord.com/channels/${originMessage.guild.id}/${m.channelId}/${m.id}`;
+          const who = m._pipTupperName ? `🎭 ${truncate(m._pipTupperName.replace(/[\r\n]/g, ' '), 45)} • ` : '';
+          return `**${page * PAGE_SIZE + i + 1}.** ${who}<t:${stamp}:f> · [Open message](${link})\n${truncate(cleanContent(m), 135)}`;
+        });
+        const embed = new EmbedBuilder().setColor(0x9b8acb)
+          .setTitle(`📍 ${place}`)
+          .setDescription(sections.join('\n\n'))
+          .setFooter({ text: `${location.messages.length} message(s) in this location • Page ${page + 1}/${pageCount} • Pip` });
+        await sendAuditToStaff(logChannel, {
+          content: `RP AUDIT | USER ID: ${targetUser.id} | ${truncate(liveName, 55)} | ${place} | ${page + 1}/${pageCount}`,
+          embeds: [embed],
+          allowedMentions: { parse: [] },
+        }, originMessage.guild.id);
       }
     }
-
   });
 
   // Only a member's own successful !rpcheck or /rpcheck counts as a check-in.
@@ -1038,48 +1038,65 @@ async function registerGuildCommands(guild) {
   }
 }
 
+// One compact home page and focused category tabs instead of one long command list.
+const HELP_TABS = [
+  ['list', 'Home'], ['members', 'Members'], ['staff', 'Staff'],
+  ['setup', 'Setup'], ['info', 'About'],
+];
 function helpButtons(view = 'list') {
-  const tabs = [
-    ['list', 'All commands'], ['info', 'About Pip'], ['setup', 'Setup guide'],
-  ];
-  return [new ActionRowBuilder().addComponents(...tabs.map(([id, label]) =>
+  return [new ActionRowBuilder().addComponents(...HELP_TABS.map(([id, label]) =>
     new ButtonBuilder().setCustomId(`pip:cmd:${id}`).setLabel(label)
       .setStyle(view === id ? ButtonStyle.Primary : ButtonStyle.Secondary)))];
 }
-
 function helpEmbed(view = 'list') {
-  const embed = new EmbedBuilder().setColor(0x8b79db).setFooter({ text: 'Pip • RP activity audits • /cmd list' });
-  if (view === 'info') {
-    return embed.setTitle('🤖 About Pip')
-      .setDescription('Pip checks RP activity across configured text channels, public threads, and accessible forum posts. Audit reports are sent to a designated private staff channel.')
-      .addFields(
-        { name: '🔎 Message-level auditing', value: 'Reports group activity by channel/post and link directly to each original message. Pip only counts accessible activity inside the selected time window.' },
-        { name: '✅ Activity check', value: '`/rpcheck` confirms privately. The only `!` command, `!rpcheck`, reacts ✅ when the audit is posted.' },
-        { name: '🔐 Access', value: 'Members can submit checks. Staff can review audits. Server managers control the bot’s configuration.' },
-        { name: '📚 Explore commands', value: 'Select **All commands** or **Setup guide** below.' },
-      );
-  }
-  if (view === 'setup') {
-    return embed.setTitle('🛠️ Pip • Quick Setup')
-      .setDescription('Use these commands in your Discord server. You must have **Manage Server** permission to configure Pip.')
-      .addFields(
-        { name: '1 • Private log', value: '`/rplogchannel channel:#rp-audit-logs`\nRestrict that channel to your staff.' },
-        { name: '2 • Check-in channel', value: '`/rpcheckchannel channel:#activity-check`' },
-        { name: '3 • Add RP sources', value: '`/rpadd channel:#roleplay-forum`\n`/rpadd channel:#roleplay-chat`\nOr use `thread_id` for a specific thread.' },
-        { name: '4 • Set audit window', value: '`/rphours hours:168` — 7 days' },
-        { name: '5 • Verify and test', value: '`/rplist` · `/rphealth` · `/rpcheck`' },
-        { name: '6 • Member chart', value: '`/rpchart refresh` scans all monitored RP sources. `/rpchart view` shows check-ins vs RP activity; `/rpchart post` maintains a staff-only dashboard. Use `/rpchart track` to include members with neither.' },
-        { name: '7 • Tupperbox RP', value: 'First run `tul!cfg log #tupper-logs` with Tupperbox, then `/tupperlogchannel channel:#tupper-logs` with Pip. Pip credits only proxy messages verified against the official log.' },
-        { name: 'Important for Railway', value: 'Attach a persistent Volume mounted at `/data` so RP channel settings survive redeploys.' },
-      );
-  }
-  return embed.setTitle('📚 Pip • Command Directory')
-    .setDescription('Use slash commands for setup, staff tools, and reports. The only remaining `!` command is **`!rpcheck`**.')
+  const embed = new EmbedBuilder().setColor(0x8b79db)
+    .setFooter({ text: 'Pip • Use the buttons to change pages • /cmd list' });
+  if (view === 'members') return embed
+    .setTitle('🌱 Pip | Member Commands')
+    .setDescription('Submit your own check in the designated activity-check channel.')
     .addFields(
-      { name: '🌱 Members', value: '`/rpcheck` or `!rpcheck` — Submit your own RP activity check\n`/cmd list` — Show this help menu\n`/cmd info` — About Pip\n`/ping` — Check whether Pip is online' },
-      { name: '🛡️ Staff', value: '`/rplog member:@user` — Audit a member\n`/rpchart view` — Check-ins vs RP chart\n`/rpchart refresh` — Rescan recent activity\n`/rpchart post` — Update staff dashboard\n`/rplist` — View monitored sources\n`/rphealth` — Check persistent storage' },
-      { name: '⚙️ Server managers', value: '`/rpadd` — Add a channel, forum, or thread\n`/rpremove` — Remove monitored source\n`/rphours` — Set audit hours\n`/rplogchannel` — Set staff audit destination\n`/rpcheckchannel` — Set check-in channel\n`/tupperlogchannel` — Set official Tupperbox log source\n`/tupperdiagnose` — Diagnose log matching\n`/rpchart track` / `/rpchart untrack` — Manage chart roster' },
-      { name: '💡 Setup walkthrough', value: 'Use `/cmd setup` or select the **Setup guide** button below.' },
+      { name: '✅ Submit activity', value: '`/rpcheck` — Submit a check privately\n`!rpcheck` — Reacts ⏳ while processing, then ✅ when posted' },
+      { name: '📖 Help and status', value: '`/cmd list` — Open Pip’s menu\n`/cmd info` — About Pip\n`/ping` — Check that Pip is online' },
+      { name: 'Where is my report?', value: 'Full activity details go to your server’s **private staff audit channel**. Staff can open original-message links from there.' },
+    );
+  if (view === 'staff') return embed
+    .setTitle('🛡️ Pip | Staff Tools')
+    .setDescription('Review individual audits, member activity, and bot health.')
+    .addFields(
+      { name: '🔎 Member audits', value: '`/rplog member:@user` — Generate an audit with message links\n`/rplist` — View monitored RP locations' },
+      { name: '📊 Activity chart', value: '`/rpchart view` — View paged member statuses\n`/rpchart refresh` — Rescan recent activity\n`/rpchart post` — Update the staff dashboard' },
+      { name: '🎭 Tupperbox + diagnostics', value: '`/tupperdiagnose` — Verify Tupperbox logs\n`/rphealth` — Check stored settings and Railway volume' },
+      { name: '⚙️ Server managers only', value: '`/rpadd` / `/rpremove` — Monitored sources\n`/rphours` — Audit window\n`/rplogchannel` / `/rpcheckchannel` — Destinations\n`/tupperlogchannel` — Ownership log\n`/rpchart track` / `/rpchart untrack` — Chart roster' },
+    );
+  if (view === 'setup') return embed
+    .setTitle('⚙️ Pip | Setup Guide')
+    .setDescription('Run these commands once as someone with **Manage Server** permission.')
+    .addFields(
+      { name: '1 · Staff reports', value: '`/rplogchannel channel:#rp-audit-logs`\nMake this channel visible to staff only.' },
+      { name: '2 · Member check-ins', value: '`/rpcheckchannel channel:#activity-check`' },
+      { name: '3 · Choose RP channels', value: '`/rpadd channel:#rp-chat`\n`/rpadd channel:#rp-forum`\nA forum includes its accessible posts; a text channel includes its public threads.' },
+      { name: '4 · Set the window', value: '`/rphours hours:165` — Example: 165 hours\n`/rplist` — Verify what Pip monitors' },
+      { name: '5 · Optional Tupperbox', value: 'Configure Tupperbox’s own log, then `/tupperlogchannel channel:#tupper-logs`.' },
+      { name: '6 · Publish staff chart', value: '`/rpchart refresh` followed by `/rpchart post`' },
+      { name: '💾 Railway', value: 'Attach a persistent Volume at `/data` to preserve settings across deployments. Check with `/rphealth`.' },
+    );
+  if (view === 'info') return embed
+    .setTitle('🤖 Pip | About')
+    .setDescription('RP activity checks for text channels, accessible forum posts and threads, with optional verified Tupperbox attribution.')
+    .addFields(
+      { name: '🔎 Original message links', value: 'Each audit is grouped by the places the member roleplayed, with clickable links for staff.' },
+      { name: '📊 Two separate statuses', value: 'The chart distinguishes **submitted an RP check** from **actually roleplayed**.' },
+      { name: '🔒 Privacy', value: 'Staff audits remain in the designated private log channel. Do not give regular members access to staff-only reports.' },
+      { name: '🎭 Crediting Tuppers', value: 'Pip only credits proxied RP messages when it can verify ownership from official Tupperbox logs.' },
+    );
+  return embed
+    .setTitle('📚 Pip | Command Center')
+    .setDescription('Your roleplay activity assistant. Pick a category below to see a **short, organized command list** instead of one crowded menu.')
+    .addFields(
+      { name: '🌱 Members', value: 'Submit activity with `/rpcheck` or `!rpcheck`.', inline: true },
+      { name: '🛡️ Staff', value: 'Open RP audits, refresh charts, and review logs.', inline: true },
+      { name: '⚙️ Setup', value: 'Manage monitored channels, time window, and Tupperbox.', inline: true },
+      { name: 'Start here', value: '**Members:** `/rpcheck`\n**Staff:** `/rplog` or `/rpchart view`\n**Managers:** `/cmd setup`' },
     );
 }
 
@@ -1095,11 +1112,21 @@ client.on(Events.GuildCreate, registerGuildCommands);
 
 client.on(Events.InteractionCreate, async interaction => {
   try {
-    // Navigation controls on /cmd list; visible only to the member who opened it.
+    // The help menu and the staff chart use Discord buttons instead of long walls of text.
     if (interaction.isButton() && interaction.customId.startsWith('pip:cmd:')) {
       const view = interaction.customId.split(':')[2];
-      if (!['list', 'info', 'setup'].includes(view)) return;
+      if (!HELP_TABS.some(([id]) => id === view)) return;
       return interaction.update({ embeds: [helpEmbed(view)], components: helpButtons(view) });
+    }
+    if (interaction.isButton() && interaction.customId.startsWith('pip:chart:')) {
+      if (!interaction.guild || !isInteractionStaff(interaction)) {
+        return interaction.reply({ content: 'This chart is for staff only.', flags: MessageFlags.Ephemeral });
+      }
+      const requested = Number(interaction.customId.split(':')[2]);
+      if (!Number.isInteger(requested) || requested < 1) return;
+      await interaction.deferUpdate();
+      const result = await buildChartEmbed(interaction.guild, requested);
+      return interaction.editReply({ embeds: [result.embed], components: chartPageButtons(result.page, result.totalPages) });
     }
     if (!interaction.isChatInputCommand() || !interaction.guild) return;
     const name = interaction.commandName;
@@ -1162,7 +1189,7 @@ client.on(Events.InteractionCreate, async interaction => {
       }
       const page = interaction.options.getInteger('page') || 1;
       const result = await buildChartEmbed(interaction.guild, page);
-      return interaction.editReply({ embeds: [result.embed], allowedMentions: { parse: [] } });
+      return interaction.editReply({ embeds: [result.embed], components: chartPageButtons(result.page, result.totalPages), allowedMentions: { parse: [] } });
     }
 
     if (name === 'rplog') {
@@ -1195,18 +1222,32 @@ client.on(Events.InteractionCreate, async interaction => {
         .setDescription(description.slice(0, 4000))], allowedMentions: { parse: [] } });
     }
     if (name === 'rplist') {
-      const sources = cfg.rpChannels.length ? cfg.rpChannels.map(id => `• <#${id}>`).join('\n') : 'None configured yet.';
-      // Embed descriptions max out at 4,096 characters; avoid giant source lists.
-      const safeSources = truncate(sources, 3300);
-      const embed = new EmbedBuilder().setColor(0x8b79db).setTitle('📚 Pip • Monitored RP Sources')
-        .setDescription(safeSources)
+      const categorized = { text: [], forums: [], threads: [], missing: [] };
+      for (const id of cfg.rpChannels) {
+        const ch = await interaction.guild.channels.fetch(id).catch(() => null);
+        const category = !ch ? 'missing'
+          : ch.type === ChannelType.GuildForum ? 'forums'
+          : ch.isThread?.() ? 'threads' : 'text';
+        categorized[category].push(id);
+      }
+      const group = (ids, empty = 'None configured') => {
+        if (!ids.length) return empty;
+        const lines = ids.slice(0, 20).map(id => `• <#${id}>`);
+        if (ids.length > 20) lines.push(`…and ${ids.length - 20} more`);
+        return lines.join('\n');
+      };
+      const embed = new EmbedBuilder().setColor(0x8b79db)
+        .setTitle('📚 Pip | Monitored RP Sources')
+        .setDescription(`**${cfg.rpChannels.length} monitored sources** • **${cfg.hours}-hour** audit window\nOnly configured RP locations are scanned.`)
         .addFields(
-          { name: '📁 Staff log', value: cfg.logChannel ? `<#${cfg.logChannel}>` : 'Not set', inline: true },
+          { name: `💬 Text channels (${categorized.text.length})`, value: group(categorized.text) },
+          { name: `🗂️ Forums (${categorized.forums.length})`, value: group(categorized.forums) },
+          { name: `🧵 Individual threads (${categorized.threads.length})`, value: group(categorized.threads) },
+          ...(categorized.missing.length ? [{ name: '⚠️ Missing or inaccessible sources', value: group(categorized.missing) }] : []),
+          { name: '📥 Staff report channel', value: cfg.logChannel ? `<#${cfg.logChannel}>` : 'Not configured', inline: true },
           { name: '✅ Check-in channel', value: cfg.checkChannel ? `<#${cfg.checkChannel}>` : 'Any channel', inline: true },
-          { name: '🕐 Audit window', value: `${cfg.hours} hours`, inline: true },
-          { name: '🎭 Tupperbox ownership log', value: cfg.tupperLogChannel ? `<#${cfg.tupperLogChannel}>` : 'Not set — Tupper messages cannot be automatically credited', inline: false },
-        )
-        .setFooter({ text: `${cfg.rpChannels.length} monitored source(s) • Pip` });
+          { name: '🎭 Tupperbox ownership log', value: cfg.tupperLogChannel ? `<#${cfg.tupperLogChannel}>` : 'Not configured' },
+        ).setFooter({ text: 'Pip • /rpadd and /rpremove change this list' });
       return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
     }
     if (name === 'rphealth') {
