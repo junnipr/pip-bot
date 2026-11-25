@@ -1,6 +1,6 @@
 {
   "name": "pip-rpcheck-bot",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "private": true,
   "description": "Pip RP activity tracker \u2014 Tupperbox ownership log attribution, optional staff webhook mirroring, slash commands and !rpcheck, forum/thread scanning, Railway volume",
   "main": "bot.js",
