@@ -3,7 +3,7 @@
 // 01 — ENVIRONMENT, BOT CLIENT, AND TUNABLE LIMITS
 // =========================================================================
 /**
- * Pip v1.9 — Discord UI edition (compatible with Pip v1.8 settings).
+ * Pip v2.0 — automatic RP chart roster (compatible with previous Pip settings).
  *
  * Entrypoint: bot.js (single-file, drop-in replacement for GitHub/Railway).
  * Member commands: !rpcheck and /rpcheck. All other prefix commands are disabled.
@@ -87,6 +87,7 @@ if (!TOKEN) {
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers, // Required for guildMemberAdd/Remove and full chart roster sync
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
   ],
@@ -181,7 +182,8 @@ function chartSettings(guildId) {
   const chart = chartDb[guildId];
   chart.checks ||= {};
   chart.activity ||= {};
-  chart.trackedIds ||= [];
+  chart.trackedIds ||= []; // Legacy name retained so older chart files still load
+  chart.rosterSyncedAt ||= 0;
   chart.warnings ||= [];
   return chart;
 }
@@ -204,11 +206,85 @@ function saveChart() {
 
 function recordCheckIn(guildId, userId, messageCount) {
   const chart = chartSettings(guildId);
+  if (!chart.trackedIds.includes(userId)) chart.trackedIds.push(userId);
   const now = Date.now();
   chart.checks[userId] ||= [];
   chart.checks[userId].push(now);
   chart.activity[userId] = { count: messageCount, scannedAt: now, hours: settings(guildId).hours };
   saveChart();
+}
+
+
+// ---------------- AUTOMATIC CHART ROSTER ----------------
+// Keep the old trackedIds storage key for backward compatibility, but populate
+// it from Discord's real guild membership rather than manual /rpchart track.
+// Never use nicknames as identity keys. Bots are excluded from the RP chart.
+// Discord Developer Portal > Bot > Server Members Intent must be ON.
+const activeRosterSyncs = new Map();
+const rosterChangesDuringSync = new Map();
+function eligibleRosterMember(member) {
+  return Boolean(member?.id && member.user && !member.user.bot);
+}
+
+function memberJoinedChart(member) {
+  if (!eligibleRosterMember(member)) return;
+  const pending = rosterChangesDuringSync.get(member.guild.id);
+  if (pending) pending.set(member.id, true);
+  const chart = chartSettings(member.guild.id);
+  if (chart.trackedIds.includes(member.id)) return;
+  chart.trackedIds.push(member.id);
+  saveChart();
+  scheduleDashboardUpdate(member.guild);
+}
+
+function memberLeftChart(member) {
+  if (!member?.guild || !member?.id) return;
+  const pending = rosterChangesDuringSync.get(member.guild.id);
+  if (pending) pending.set(member.id, false);
+  const chart = chartSettings(member.guild.id);
+  const before = chart.trackedIds.length;
+  chart.trackedIds = chart.trackedIds.filter(id => id !== member.id);
+  // Members who leave should no longer appear as "checked in" or "roleplayed".
+  // This does not delete past staff audit reports in Discord.
+  delete chart.checks[member.id];
+  delete chart.activity[member.id];
+  if (before !== chart.trackedIds.length) {
+    saveChart();
+    scheduleDashboardUpdate(member.guild);
+  }
+}
+
+async function syncChartRoster(guild) {
+  if (activeRosterSyncs.has(guild.id)) return activeRosterSyncs.get(guild.id);
+  // Full member fetch is performed at startup / guild join, or on /rpchart sync;
+  // it is not repeated each time staff open the chart.
+  const changes = new Map();
+  rosterChangesDuringSync.set(guild.id, changes);
+  const operation = (async () => {
+    const allMembers = await guild.members.fetch();
+    const roster = new Set();
+    for (const member of allMembers.values()) {
+      if (eligibleRosterMember(member)) roster.add(member.id);
+    }
+    // Preserve joins/leaves that happened while Discord was returning chunks.
+    for (const [id, joined] of changes) {
+      if (joined) roster.add(id);
+      else roster.delete(id);
+    }
+    const chart = chartSettings(guild.id);
+    chart.trackedIds = [...roster].sort();
+    chart.rosterSyncedAt = Date.now();
+    saveChart();
+    scheduleDashboardUpdate(guild);
+    console.log(`Pip roster: synchronized ${roster.size} human members in ${guild.name} (${guild.id})`);
+    return { members: roster.size, at: chart.rosterSyncedAt };
+  })();
+  activeRosterSyncs.set(guild.id, operation);
+  try { return await operation; }
+  finally {
+    activeRosterSyncs.delete(guild.id);
+    if (rosterChangesDuringSync.get(guild.id) === changes) rosterChangesDuringSync.delete(guild.id);
+  }
 }
 
 
@@ -524,7 +600,7 @@ async function scanChildThreads(parent, userId, cutoff, owners = new Map()) {
 
 
 // =========================================================================
-// 07 — CHART REFRESH, NICKNAME LOOKUP, AND DASHBOARD
+// 07 — AUTOMATIC MEMBER ROSTER, CHART REFRESH, AND DASHBOARD
 // =========================================================================
 function cleanNick(name) {
   return truncate(String(name || 'Unknown member').replace(/[\r\n`*_~|<>]/g, ' ').replace(/@everyone|@here/gi, '[mention]'), 54);
@@ -620,11 +696,12 @@ async function buildChartEmbed(guild, pageNumber = 1) {
   const checkers = new Set(Object.entries(chart.checks)
     .filter(([, history]) => Array.isArray(history) && history.some(t => t >= cutoff))
     .map(([id]) => id));
-  const ids = new Set([
-    ...chart.trackedIds,
-    ...checkers,
-    ...Object.entries(chart.activity).filter(([, a]) => a?.count > 0 && a.hours === cfg.hours && a.scannedAt >= cutoff).map(([id]) => id),
-  ]);
+  const activeIds = Object.entries(chart.activity)
+    .filter(([, a]) => a?.count > 0 && a.hours === cfg.hours && a.scannedAt >= cutoff)
+    .map(([id]) => id);
+  const ids = new Set(chart.rosterSyncedAt
+    ? chart.trackedIds // Once synced, show CURRENT server members, including zero-activity users.
+    : [...chart.trackedIds, ...checkers, ...activeIds]);
   const hasFreshScan = Boolean(chart.lastRefreshedAt && chart.refreshedForHours === cfg.hours && chart.lastRefreshedAt >= cutoff);
   const rows = [...ids].map(id => {
     const recentScan = chart.activity[id]?.hours === cfg.hours && chart.activity[id]?.scannedAt >= cutoff ? chart.activity[id] : null;
@@ -655,10 +732,11 @@ async function buildChartEmbed(guild, pageNumber = 1) {
       { name: '✅ Checked in', value: String(checkedCount), inline: true },
       { name: '✍️ Roleplayed', value: String(activeCount), inline: true },
       { name: '👥 Listed members', value: String(rows.length), inline: true },
-      { name: `Members • Page ${page}/${totalPages}`, value: lines.length ? truncate(lines.join('\n'), 1020) : 'No members listed yet. Use `/rpchart refresh` or `/rpchart track`.' },
+      { name: `Members • Page ${page}/${totalPages}`, value: lines.length ? truncate(lines.join('\n'), 1020) : 'Roster not loaded yet. Use `/rpchart sync` to list everyone.' },
       { name: '📅 Tracking window', value: `Last **${cfg.hours} hours** • RP scan: ${refreshLine}` },
+      { name: '👤 Server roster', value: chart.rosterSyncedAt ? `Synced <t:${Math.floor(chart.rosterSyncedAt / 1000)}:R> • new joins added automatically` : 'Not yet synced • use `/rpchart sync`' },
     )
-    .setFooter({ text: 'Staff only • Nicknames refresh on view • /rpchart refresh rescans RP' });
+    .setFooter({ text: 'Staff only • Auto-roster for human members • Nicknames refresh on view' });
   if (hasFreshScan && chart.warnings.length) {
     embed.addFields({ name: '⚠️ Scan limits', value: `${chart.warnings.length} source warning(s) — counts may be incomplete.` });
   }
@@ -1017,13 +1095,10 @@ const SLASH_COMMANDS = [
     .addSubcommand(o => o.setName('setup').setDescription('Read the server setup guide.')),
   new SlashCommandBuilder().setName('rpchart').setDescription('Staff: view and update the RP check-in and activity chart.')
     .addSubcommand(o => o.setName('view').setDescription('View the RP activity and check-in chart.')
-      .addIntegerOption(p => p.setName('page').setDescription('Chart page (15 members per page)').setMinValue(1).setRequired(false)))
+      .addIntegerOption(p => p.setName('page').setDescription('Chart page (10 members per page)').setMinValue(1).setRequired(false)))
     .addSubcommand(o => o.setName('refresh').setDescription('Scan monitored RP sources and refresh the chart.'))
     .addSubcommand(o => o.setName('post').setDescription('Post or update the chart in the private staff log.'))
-    .addSubcommand(o => o.setName('track').setDescription('Include a member on the chart even if they have no activity.')
-      .addUserOption(p => p.setName('member').setDescription('Server member to track').setRequired(true)))
-    .addSubcommand(o => o.setName('untrack').setDescription('Stop manually tracking a member on the chart.')
-      .addUserOption(p => p.setName('member').setDescription('Member to stop tracking').setRequired(true))),
+    .addSubcommand(o => o.setName('sync').setDescription('Manager: add every current server member to the chart.')),
   new SlashCommandBuilder().setName('ping').setDescription('Check whether Pip is online and responsive.'),
 ];
 
@@ -1064,9 +1139,9 @@ function helpEmbed(view = 'list') {
     .setDescription('Review individual audits, member activity, and bot health.')
     .addFields(
       { name: '🔎 Member audits', value: '`/rplog member:@user` — Generate an audit with message links\n`/rplist` — View monitored RP locations' },
-      { name: '📊 Activity chart', value: '`/rpchart view` — View paged member statuses\n`/rpchart refresh` — Rescan recent activity\n`/rpchart post` — Update the staff dashboard' },
+      { name: '📊 Activity chart', value: '`/rpchart view` — Everyone in the server, paged\n`/rpchart refresh` — Rescan recent activity\n`/rpchart post` — Update the staff dashboard\n`/rpchart sync` — Rebuild the member roster' },
       { name: '🎭 Tupperbox + diagnostics', value: '`/tupperdiagnose` — Verify Tupperbox logs\n`/rphealth` — Check stored settings and Railway volume' },
-      { name: '⚙️ Server managers only', value: '`/rpadd` / `/rpremove` — Monitored sources\n`/rphours` — Audit window\n`/rplogchannel` / `/rpcheckchannel` — Destinations\n`/tupperlogchannel` — Ownership log\n`/rpchart track` / `/rpchart untrack` — Chart roster' },
+      { name: '⚙️ Server managers only', value: '`/rpadd` / `/rpremove` — Monitored sources\n`/rphours` — Audit window\n`/rplogchannel` / `/rpcheckchannel` — Destinations\n`/tupperlogchannel` — Ownership log\n`/rpchart sync` — Sync all existing members' },
     );
   if (view === 'setup') return embed
     .setTitle('⚙️ Pip | Setup Guide')
@@ -1085,7 +1160,7 @@ function helpEmbed(view = 'list') {
     .setDescription('RP activity checks for text channels, accessible forum posts and threads, with optional verified Tupperbox attribution.')
     .addFields(
       { name: '🔎 Original message links', value: 'Each audit is grouped by the places the member roleplayed, with clickable links for staff.' },
-      { name: '📊 Two separate statuses', value: 'The chart distinguishes **submitted an RP check** from **actually roleplayed**.' },
+      { name: '📊 Two separate statuses', value: 'The chart automatically includes **all current human members**, even before they check in. It distinguishes **submitted an RP check** from **actually roleplayed**.' },
       { name: '🔒 Privacy', value: 'Staff audits remain in the designated private log channel. Do not give regular members access to staff-only reports.' },
       { name: '🎭 Crediting Tuppers', value: 'Pip only credits proxied RP messages when it can verify ownership from official Tupperbox logs.' },
     );
@@ -1106,9 +1181,22 @@ function helpEmbed(view = 'list') {
 // =========================================================================
 client.once(Events.ClientReady, async readyClient => {
   console.log(`Logged in as ${readyClient.user.tag}`);
+  // Start the member backfill without blocking command registration.
   await Promise.allSettled([...readyClient.guilds.cache.values()].map(registerGuildCommands));
+  for (const guild of readyClient.guilds.cache.values()) {
+    syncChartRoster(guild).catch(error => console.error(`Roster sync failed in ${guild.id}:`, error));
+  }
 });
-client.on(Events.GuildCreate, registerGuildCommands);
+client.on(Events.GuildCreate, guild => {
+  registerGuildCommands(guild).catch(error => console.error('Command registration failed:', error));
+  syncChartRoster(guild).catch(error => console.error(`Roster sync failed in ${guild.id}:`, error));
+});
+client.on(Events.GuildMemberAdd, member => memberJoinedChart(member));
+client.on(Events.GuildMemberRemove, member => memberLeftChart(member));
+client.on(Events.GuildMemberUpdate, (oldMember, newMember) => {
+  // Only repaint after a display-name change, not every unrelated role update.
+  if (oldMember.displayName !== newMember.displayName) scheduleDashboardUpdate(newMember.guild);
+});
 
 client.on(Events.InteractionCreate, async interaction => {
   try {
@@ -1156,23 +1244,19 @@ client.on(Events.InteractionCreate, async interaction => {
 
     if (name === 'rpchart') {
       const action = interaction.options.getSubcommand();
-      if (action === 'track' || action === 'untrack') {
-        if (!isInteractionManager(interaction)) return respondPrivately(interaction, 'You need **Manage Server** to change the chart roster.');
-        const member = interaction.options.getUser('member', true);
-        const chart = chartSettings(interaction.guild.id);
-        if (action === 'track') {
-          const inServer = await interaction.guild.members.fetch({ user: member.id, force: true }).catch(() => null);
-          if (!inServer) return respondPrivately(interaction, 'That member is not in this server.');
-          if (!chart.trackedIds.includes(member.id)) chart.trackedIds.push(member.id);
-        } else {
-          chart.trackedIds = chart.trackedIds.filter(id => id !== member.id);
-        }
-        saveChart();
-        return respondPrivately(interaction, action === 'track'
-          ? `✅ Added ${member.username} to the chart roster. Their current server nickname will be shown when viewed.`
-          : `✅ Removed the manual roster entry for ${member.username}. Existing RP activity and check-in records will still be included until they fall outside the time window.`);
+      if (action === 'sync' && !isInteractionManager(interaction)) {
+        return respondPrivately(interaction, 'You need **Manage Server** to sync the server roster.');
       }
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      if (action === 'sync') {
+        try {
+          const result = await syncChartRoster(interaction.guild);
+          return interaction.editReply({ content: `✅ Synced **${result.members} current server members** into the chart (bots excluded). New members will be added automatically when they join. Run **/rpchart view** to see the roster.`, allowedMentions: { parse: [] } });
+        } catch (error) {
+          console.error('Pip roster sync failed:', error);
+          return interaction.editReply({ content: '⚠️ Could not sync members. Enable **Server Members Intent** in the Discord Developer Portal, then restart Pip on Railway and retry **/rpchart sync**.' });
+        }
+      }
       if (action === 'refresh') {
         // Bounded concurrency; scans no longer wait for someone else's report pages.
         const result = await withAuditSlot(() => refreshActivityChart(interaction.guild));
