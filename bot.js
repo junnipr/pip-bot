@@ -1121,7 +1121,7 @@ const SLASH_COMMANDS = [
     .addStringOption(o => o.setName('thread_id').setDescription('Optional: exact thread ID instead of a channel').setRequired(false)),
   new SlashCommandBuilder().setName('rplist').setDescription('Staff: view Pip’s monitored sources and settings.'),
   new SlashCommandBuilder().setName('rphours').setDescription('Admin: set the RP audit lookback period.')
-    .addIntegerOption(o => o.setName('hours').setDescription('1 to 336 hours; 168 = one week').setMinValue(1).setMaxValue(336).setRequired(true)),
+    .addIntegerOption(o => o.setName('hours').setDescription('1 to 336 hours; 168 = one week').setMinValue(1).setMaxValue(744).setRequired(true)),
   new SlashCommandBuilder().setName('rplogchannel').setDescription('Admin: set the private staff audit log channel.')
     .addChannelOption(o => o.setName('channel').setDescription('Staff-only text channel').setRequired(true)),
   new SlashCommandBuilder().setName('rpcheckchannel').setDescription('Admin: choose where members submit RP checks.')
