@@ -1,6 +1,6 @@
 /**
- * RP Check Bot - discord.js 14
- * Members use !rpcheck or /rpcheck in the configured check channel.
+ * Pip v1.5 - discord.js 14
+ * Members use !rpcheck or /rpcheck in the configured check channel. All other commands use /.
  * The bot audits recent messages in configured RP text, thread, and forum channels, sends a staff log,
  * and reacts ✅ once the report has been sent.
  */
@@ -31,6 +31,7 @@ const STAFF_ROLE_IDS = new Set(
 // PIP_DATA_DIR is an optional override for other hosts; use an absolute path.
 const DATA_DIR = process.env.PIP_DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname;
 const CONFIG_PATH = path.join(DATA_DIR, 'rpcheck-config.json');
+const CHART_PATH = path.join(DATA_DIR, 'rpcheck-chart.json');
 const LEGACY_CONFIG_PATH = path.join(__dirname, 'rpcheck-config.json');
 const MAX_PAGES_PER_CHANNEL = 50; // 5,000 recent messages per text channel or forum post
 const MAX_THREADS_PER_PARENT = 300;
@@ -73,6 +74,15 @@ const SLASH_COMMANDS = [
     .addSubcommand(o => o.setName('list').setDescription('View the complete command directory.'))
     .addSubcommand(o => o.setName('info').setDescription('Learn about Pip and its audit reports.'))
     .addSubcommand(o => o.setName('setup').setDescription('Read the server setup guide.')),
+  new SlashCommandBuilder().setName('rpchart').setDescription('Staff: view and update the RP check-in and activity chart.')
+    .addSubcommand(o => o.setName('view').setDescription('View the RP activity and check-in chart.')
+      .addIntegerOption(p => p.setName('page').setDescription('Chart page (15 members per page)').setMinValue(1).setRequired(false)))
+    .addSubcommand(o => o.setName('refresh').setDescription('Scan monitored RP sources and refresh the chart.'))
+    .addSubcommand(o => o.setName('post').setDescription('Post or update the chart in the private staff log.'))
+    .addSubcommand(o => o.setName('track').setDescription('Include a member on the chart even if they have no activity.')
+      .addUserOption(p => p.setName('member').setDescription('Server member to track').setRequired(true)))
+    .addSubcommand(o => o.setName('untrack').setDescription('Stop manually tracking a member on the chart.')
+      .addUserOption(p => p.setName('member').setDescription('Member to stop tracking').setRequired(true))),
   new SlashCommandBuilder().setName('ping').setDescription('Check whether Pip is online and responsive.'),
 ];
 
@@ -103,7 +113,7 @@ function helpEmbed(view = 'list') {
       .setDescription('Pip checks RP activity across configured text channels, public threads, and accessible forum posts. Audit reports are sent to a designated private staff channel.')
       .addFields(
         { name: '🔎 Message-level auditing', value: 'Reports group activity by channel/post and link directly to each original message. Pip only counts accessible activity inside the selected time window.' },
-        { name: '✅ Two command styles', value: '`/rpcheck` confirms privately when finished. The original `!rpcheck` still reacts ✅ to the member’s message after posting the audit.' },
+        { name: '✅ Activity check', value: '`/rpcheck` confirms privately. The only `!` command, `!rpcheck`, reacts ✅ when the audit is posted.' },
         { name: '🔐 Access', value: 'Members can submit checks. Staff can review audits. Server managers control the bot’s configuration.' },
         { name: '📚 Explore commands', value: 'Select **All commands** or **Setup guide** below.' },
       );
@@ -117,15 +127,16 @@ function helpEmbed(view = 'list') {
         { name: '3 • Add RP sources', value: '`/rpadd channel:#roleplay-forum`\n`/rpadd channel:#roleplay-chat`\nOr use `thread_id` for a specific thread.' },
         { name: '4 • Set audit window', value: '`/rphours hours:168` — 7 days' },
         { name: '5 • Verify and test', value: '`/rplist` · `/rphealth` · `/rpcheck`' },
+        { name: '6 • Member chart', value: '`/rpchart refresh` scans all monitored RP sources. `/rpchart view` shows check-ins vs RP activity; `/rpchart post` maintains a staff-only dashboard. Use `/rpchart track` to include members with neither.' },
         { name: 'Important for Railway', value: 'Attach a persistent Volume mounted at `/data` so RP channel settings survive redeploys.' },
       );
   }
   return embed.setTitle('📚 Pip • Command Directory')
-    .setDescription('Use `/` to pick a command. Choose a section below for more information. **Existing `!` commands still work.**')
+    .setDescription('Use slash commands for setup, staff tools, and reports. The only remaining `!` command is **`!rpcheck`**.')
     .addFields(
-      { name: '🌱 Members', value: '`/rpcheck` — Submit your own RP activity check\n`/cmd list` — Show this help menu\n`/cmd info` — About Pip\n`/ping` — Check whether Pip is online' },
-      { name: '🛡️ Staff', value: '`/rplog member:@user` — Audit a member\n`/rplist` — View monitored sources\n`/rphealth` — Check persistent storage' },
-      { name: '⚙️ Server managers', value: '`/rpadd` — Add a channel, forum, or thread\n`/rpremove` — Remove monitored source\n`/rphours` — Set audit hours\n`/rplogchannel` — Set staff audit destination\n`/rpcheckchannel` — Set check-in channel' },
+      { name: '🌱 Members', value: '`/rpcheck` or `!rpcheck` — Submit your own RP activity check\n`/cmd list` — Show this help menu\n`/cmd info` — About Pip\n`/ping` — Check whether Pip is online' },
+      { name: '🛡️ Staff', value: '`/rplog member:@user` — Audit a member\n`/rpchart view` — Check-ins vs RP chart\n`/rpchart refresh` — Rescan recent activity\n`/rpchart post` — Update staff dashboard\n`/rplist` — View monitored sources\n`/rphealth` — Check persistent storage' },
+      { name: '⚙️ Server managers', value: '`/rpadd` — Add a channel, forum, or thread\n`/rpremove` — Remove monitored source\n`/rphours` — Set audit hours\n`/rplogchannel` — Set staff audit destination\n`/rpcheckchannel` — Set check-in channel\n`/rpchart track` / `/rpchart untrack` — Manage chart roster' },
       { name: '💡 Setup walkthrough', value: 'Use `/cmd setup` or select the **Setup guide** button below.' },
     );
 }
@@ -193,19 +204,211 @@ function saveSettings() {
   fs.renameSync(tmp, CONFIG_PATH);
 }
 
-function isManager(message) {
-  return message.guild.ownerId === message.author.id ||
-    message.member.permissions.has(PermissionFlagsBits.ManageGuild);
+// The chart uses Discord user IDs as keys, never nicknames. Its file lives on the
+// SAME Railway Volume as rpcheck-config.json. No message bodies are stored here.
+let chartDb = {};
+if (fs.existsSync(CHART_PATH)) {
+  try {
+    chartDb = JSON.parse(fs.readFileSync(CHART_PATH, 'utf8'));
+    if (!chartDb || typeof chartDb !== 'object' || Array.isArray(chartDb)) throw new Error('Invalid chart data');
+  } catch (error) {
+    console.error(`Cannot read ${CHART_PATH} (not overwriting it):`, error);
+    process.exit(1);
+  }
+}
+console.log(`Pip chart path: ${CHART_PATH}`);
+
+function chartSettings(guildId) {
+  if (!chartDb[guildId]) {
+    chartDb[guildId] = {
+      checks: {}, activity: {}, trackedIds: [], lastRefreshedAt: 0,
+      refreshedForHours: null, warnings: [], dashboard: null,
+    };
+  }
+  const chart = chartDb[guildId];
+  chart.checks ||= {};
+  chart.activity ||= {};
+  chart.trackedIds ||= [];
+  chart.warnings ||= [];
+  return chart;
 }
 
-function isStaff(message) {
-  return isManager(message) ||
-    [...STAFF_ROLE_IDS].some(id => message.member.roles.cache.has(id));
+function saveChart() {
+  // Keep only the last 31 days of check-in timestamps, and at most 40 per member.
+  const cutoff = Date.now() - 31 * 24 * 60 * 60 * 1000;
+  for (const chart of Object.values(chartDb)) {
+    for (const [id, history] of Object.entries(chart.checks || {})) {
+      if (!Array.isArray(history)) { delete chart.checks[id]; continue; }
+      const recent = history.filter(t => Number.isFinite(t) && t >= cutoff).slice(-40);
+      if (recent.length) chart.checks[id] = recent;
+      else delete chart.checks[id];
+    }
+  }
+  const temporary = `${CHART_PATH}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(chartDb, null, 2));
+  fs.renameSync(temporary, CHART_PATH);
 }
 
-async function parseChannel(message, input) {
-  const id = input?.match(/^<#(\d+)>$|^(\d+)$/)?.slice(1).find(Boolean);
-  return id ? message.guild.channels.fetch(id).catch(() => null) : null;
+function recordCheckIn(guildId, userId, messageCount) {
+  const chart = chartSettings(guildId);
+  const now = Date.now();
+  chart.checks[userId] ||= [];
+  chart.checks[userId].push(now);
+  chart.activity[userId] = { count: messageCount, scannedAt: now, hours: settings(guildId).hours };
+  saveChart();
+}
+
+function cleanNick(name) {
+  return truncate(String(name || 'Unknown member').replace(/[\r\n`*_~|<>]/g, ' ').replace(/@everyone|@here/gi, '[mention]'), 54);
+}
+
+async function getLiveServerName(guild, userId) {
+  // force: true retrieves the CURRENT nickname, rather than a stale member cache.
+  try {
+    const member = await guild.members.fetch({ user: userId, force: true });
+    if (member) return cleanNick(member.displayName);
+  } catch (_error) {
+    // The member may have left, or Pip cannot fetch them.
+  }
+  try {
+    const user = await client.users.fetch(userId);
+    return `${cleanNick(user.globalName || user.username)} (not in server)`;
+  } catch (_error) {
+    return `Unknown user (${userId})`;
+  }
+}
+
+// Reads all monitored sources once, collecting activity across ALL authors rather
+// than requiring each member to submit a check. This can be an expensive operation
+// on busy servers; use /rpchart refresh when staff need a current snapshot.
+async function refreshActivityChart(guild) {
+  const cfg = settings(guild.id);
+  if (!cfg.rpChannels.length) throw new Error('No RP channels configured. Use /rpadd first.');
+  const cutoff = Date.now() - cfg.hours * 60 * 60 * 1000;
+  const uniqueMessages = new Map();
+  const warnings = [];
+  for (const id of cfg.rpChannels) {
+    const channel = await guild.channels.fetch(id).catch(() => null);
+    if (!isSupportedMonitorChannel(channel)) {
+      warnings.push(`Monitored source ${id} is missing or unsupported`);
+      continue;
+    }
+    try {
+      if (channel.type === ChannelType.GuildForum) {
+        const result = await scanChildThreads(channel, null, cutoff);
+        result.matches.forEach(m => uniqueMessages.set(m.id, m));
+        warnings.push(...result.warnings);
+      } else if (channel.isThread()) {
+        const result = await scanChannel(channel, null, cutoff);
+        result.matches.forEach(m => uniqueMessages.set(m.id, m));
+        if (result.truncated) warnings.push(`${channel.name}: scan limit reached`);
+      } else {
+        const own = await scanChannel(channel, null, cutoff);
+        const children = await scanChildThreads(channel, null, cutoff);
+        [...own.matches, ...children.matches].forEach(m => uniqueMessages.set(m.id, m));
+        if (own.truncated) warnings.push(`${channel.name}: scan limit reached`);
+        warnings.push(...children.warnings);
+      }
+    } catch (error) {
+      console.error(`Cannot refresh chart for ${id}`, error);
+      warnings.push(`${channel.name}: messages inaccessible`);
+    }
+  }
+  const chart = chartSettings(guild.id);
+  const at = Date.now();
+  const activity = {};
+  for (const m of uniqueMessages.values()) {
+    const id = m.author.id;
+    if (!activity[id]) activity[id] = { count: 0, scannedAt: at, hours: cfg.hours };
+    activity[id].count++;
+  }
+  chart.activity = activity;
+  chart.lastRefreshedAt = at;
+  chart.refreshedForHours = cfg.hours;
+  chart.warnings = warnings.slice(0, 50);
+  saveChart();
+  return { members: Object.keys(activity).length, messages: uniqueMessages.size, warnings };
+}
+
+const CHART_PAGE_SIZE = 15;
+async function buildChartEmbed(guild, pageNumber = 1) {
+  const cfg = settings(guild.id);
+  const chart = chartSettings(guild.id);
+  const cutoff = Date.now() - cfg.hours * 3600000;
+  const checkers = new Set(Object.entries(chart.checks)
+    .filter(([, history]) => Array.isArray(history) && history.some(t => t >= cutoff))
+    .map(([id]) => id));
+  const ids = new Set([
+    ...chart.trackedIds,
+    ...checkers,
+    ...Object.entries(chart.activity).filter(([, a]) => a?.count > 0 && a.hours === cfg.hours && a.scannedAt >= cutoff).map(([id]) => id),
+  ]);
+  // A specific user may have a recent on-demand audit even before a full refresh.
+  const hasFreshScan = Boolean(chart.lastRefreshedAt && chart.refreshedForHours === cfg.hours && chart.lastRefreshedAt >= cutoff);
+  const rows = [...ids].map(id => {
+    const recentScan = chart.activity[id]?.hours === cfg.hours && chart.activity[id]?.scannedAt >= cutoff ? chart.activity[id] : null;
+    const rpCount = recentScan?.count ?? (hasFreshScan ? 0 : null);
+    return { id, checked: checkers.has(id), rpCount, scanAt: recentScan?.scannedAt || 0 };
+  }).sort((a, b) => Number(b.checked) - Number(a.checked) ||
+    Number(b.rpCount > 0) - Number(a.rpCount > 0) || b.rpCount - a.rpCount || a.id.localeCompare(b.id));
+  const totalPages = Math.max(1, Math.ceil(rows.length / CHART_PAGE_SIZE));
+  const page = Math.min(Math.max(1, pageNumber), totalPages);
+  const items = rows.slice((page - 1) * CHART_PAGE_SIZE, page * CHART_PAGE_SIZE);
+  const names = await Promise.all(items.map(item => getLiveServerName(guild, item.id)));
+  const lines = items.map((item, i) => {
+    const check = item.checked ? '✅' : '—';
+    const played = item.rpCount === null ? '❔' : item.rpCount > 0 ? '✅' : '—';
+    const quantity = item.rpCount > 0 ? ` · ${item.rpCount} messages` : '';
+    return `${check}  ${played}  **${names[i]}**${quantity}`;
+  });
+  const checkedCount = rows.filter(r => r.checked).length;
+  const activeCount = rows.filter(r => r.rpCount > 0).length;
+  const refreshLine = hasFreshScan
+    ? `<t:${Math.floor(chart.lastRefreshedAt / 1000)}:f> (as-of snapshot)`
+    : 'Not refreshed for this audit window — use `/rpchart refresh`';
+  const embed = new EmbedBuilder().setColor(0x8b79db)
+    .setTitle('📊 Pip • RP Check-In & Activity Chart')
+    .setDescription([
+      `**Period:** Last ${cfg.hours} hours`,
+      `**Checked in:** ${checkedCount}   •   **RP observed:** ${activeCount}   •   **Listed:** ${rows.length}`,
+      `**RP scan:** ${refreshLine}`,
+      '',
+      '**Check-in  RP  —  Current in-server name**',
+      ...(lines.length ? lines : ['No entries yet. Run `/rpchart refresh` or `/rpchart track`.']),
+    ].join('\n'))
+    .addFields({ name: 'How it works', value: '✅ = yes · — = no · ❔ = not scanned. Check-in means `/rpcheck` or `!rpcheck` successfully posted an audit. Staff `/rplog` does **not** count as a check-in.' })
+    .setFooter({ text: `Page ${page}/${totalPages} • Pip tracks Discord IDs, so nicknames are looked up when rendered` });
+  if (hasFreshScan && chart.warnings.length) {
+    embed.addFields({ name: '⚠️ Scan limitations', value: `Some sources were incomplete (${chart.warnings.length} issue(s)). Results may undercount RP.` });
+  }
+  if (!chart.trackedIds.length) {
+    embed.addFields({ name: 'Who appears?', value: 'Members with a recorded check-in or observed RP activity. Use `/rpchart track` for members with neither. Pip does not automatically enumerate every server member.' });
+  }
+  return { embed, page, totalPages, tracked: rows.length };
+}
+
+async function updateChartDashboard(guild) {
+  const cfg = settings(guild.id);
+  if (!cfg.logChannel) throw new Error('Set /rplogchannel before posting the chart.');
+  const channel = await guild.channels.fetch(cfg.logChannel).catch(() => null);
+  if (!channel?.isTextBased?.() || !channel.send) throw new Error('Cannot access staff log channel.');
+  const chart = chartSettings(guild.id);
+  const { embed, totalPages } = await buildChartEmbed(guild, 1);
+  const payload = {
+    content: `PIP RP CHART | ${guild.id} | Staff dashboard${totalPages > 1 ? ` (page 1/${totalPages}; use /rpchart view for remaining pages)` : ''}`,
+    embeds: [embed], allowedMentions: { parse: [] },
+  };
+  if (chart.dashboard?.channelId === channel.id && chart.dashboard?.messageId) {
+    const previous = await channel.messages.fetch(chart.dashboard.messageId).catch(() => null);
+    if (previous) {
+      await previous.edit(payload);
+      return previous;
+    }
+  }
+  const posted = await channel.send(payload);
+  chart.dashboard = { channelId: channel.id, messageId: posted.id };
+  saveChart();
+  return posted;
 }
 
 function isSupportedChannel(channel) {
@@ -241,7 +444,7 @@ async function scanChannel(channel, userId, cutoff) {
         foundOldMessage = true;
         break;
       }
-      if (m.author.id === userId && !m.author.bot) {
+      if ((!userId || m.author.id === userId) && !m.author.bot) {
         matches.push(m);
       }
     }
@@ -376,12 +579,12 @@ function paginateDetails(header, lines, maximum = 1850) {
 async function runAudit(originMessage, targetUser) {
   const cfg = settings(originMessage.guild.id);
   if (!cfg.logChannel || cfg.rpChannels.length === 0) {
-    return reply(originMessage, 'RP check is not configured yet. Staff: use `!rplogchannel #channel` and `!rpadd #channel`.');
+    return reply(originMessage, 'RP check is not configured yet. Staff: use `/rplogchannel` and `/rpadd`.');
   }
 
   const logChannel = await originMessage.guild.channels.fetch(cfg.logChannel).catch(() => null);
   if (!logChannel?.isTextBased() || !logChannel.send) {
-    return reply(originMessage, 'The staff log channel is missing or inaccessible. Ask staff to set `!rplogchannel #channel`.');
+    return reply(originMessage, 'The staff log channel is missing or inaccessible. Ask staff to use `/rplogchannel`.');
   }
 
   const cutoff = Date.now() - cfg.hours * 60 * 60 * 1000;
@@ -433,7 +636,8 @@ async function runAudit(originMessage, targetUser) {
   const locations = [...byLocation.values()].sort((a, b) =>
     b.messages.length - a.messages.length || b.messages[0].createdTimestamp - a.messages[0].createdTimestamp);
   const time = Math.floor(Date.now() / 1000);
-  const searchableTag = `RP AUDIT | ${targetUser.username} | USER ID: ${targetUser.id}`;
+  const liveName = await getLiveServerName(originMessage.guild, targetUser.id);
+  const searchableTag = `RP AUDIT | ${liveName} | USER ID: ${targetUser.id}`;
   const linkToCheck = originMessage.url
     ? `Source check: ${originMessage.url}`
     : `Requested with /${originMessage.commandName} in <#${originMessage.channelId}>`;
@@ -441,9 +645,9 @@ async function runAudit(originMessage, targetUser) {
   const status = warnings.length ? '⚠️ Partial scan — see notes' : '✅ Scan completed';
   const summaryEmbed = new EmbedBuilder()
     .setColor(warnings.length ? 0xe8a23a : 0x667eea)
-    .setTitle(`📋 RP Activity Audit — ${truncate(targetUser.username, 100)}`)
+    .setTitle(`📋 RP Activity Audit — ${truncate(liveName, 100)}`)
     .setDescription([
-      `**Member:** ${targetUser.username} (\`${targetUser.id}\`)`,
+      `**Member:** ${liveName} (\`${targetUser.id}\`)`,
       `**Requested by:** ${originMessage.author.username}`,
       `**Period:** Last ${cfg.hours} hours`,
       `**Messages found:** **${found.length}**`,
@@ -507,8 +711,23 @@ async function runAudit(originMessage, targetUser) {
     }
   }
 
+  // Only a member's own successful !rpcheck or /rpcheck counts as a check-in.
+  // Staff /rplog audits never count as submitted checks.
+  const isSelfCheck = originMessage._interaction
+    ? originMessage.commandName === 'rpcheck'
+    : originMessage.content.trim().toLowerCase() === '!rpcheck';
+  if (isSelfCheck) {
+    try {
+      recordCheckIn(originMessage.guild.id, targetUser.id, found.length);
+      const chart = chartSettings(originMessage.guild.id);
+      if (chart.dashboard?.messageId) await updateChartDashboard(originMessage.guild);
+    } catch (error) {
+      console.error('Could not save/update check-in chart:', error);
+    }
+  }
+
   // Slash commands have no ordinary user message to react to. Confirm them
-  // privately; retain ✅ on the original message for the legacy !rpcheck command.
+  // privately; retain ✅ on the original message for !rpcheck.
   if (originMessage._interaction) {
     await reply(originMessage, `✅ RP audit posted to <#${cfg.logChannel}>. Found **${found.length}** message(s) across **${locations.length}** active location(s).`);
   } else {
@@ -565,10 +784,50 @@ client.on(Events.InteractionCreate, async interaction => {
       return;
     }
 
-    const staffCommands = ['rplog', 'rplist', 'rphealth', 'rpadd', 'rpremove', 'rphours', 'rplogchannel', 'rpcheckchannel'];
+    const staffCommands = ['rplog', 'rplist', 'rphealth', 'rpchart', 'rpadd', 'rpremove', 'rphours', 'rplogchannel', 'rpcheckchannel'];
     if (!staffCommands.includes(name)) return;
     if (!isInteractionStaff(interaction)) {
       return respondPrivately(interaction, 'This is a staff-only command.');
+    }
+
+    if (name === 'rpchart') {
+      const action = interaction.options.getSubcommand();
+      if (action === 'track' || action === 'untrack') {
+        if (!isInteractionManager(interaction)) return respondPrivately(interaction, 'You need **Manage Server** to change the chart roster.');
+        const member = interaction.options.getUser('member', true);
+        const chart = chartSettings(interaction.guild.id);
+        if (action === 'track') {
+          const inServer = await interaction.guild.members.fetch({ user: member.id, force: true }).catch(() => null);
+          if (!inServer) return respondPrivately(interaction, 'That member is not in this server.');
+          if (!chart.trackedIds.includes(member.id)) chart.trackedIds.push(member.id);
+        } else {
+          chart.trackedIds = chart.trackedIds.filter(id => id !== member.id);
+        }
+        saveChart();
+        return respondPrivately(interaction, action === 'track'
+          ? `✅ Added ${member.username} to the chart roster. Their current server nickname will be shown when viewed.`
+          : `✅ Removed the manual roster entry for ${member.username}. Existing RP activity and check-in records will still be included until they fall outside the time window.`);
+      }
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      if (action === 'refresh') {
+        // Don't let the complete-source scan interleave with long multi-page staff audits.
+        const job = auditQueue.then(() => refreshActivityChart(interaction.guild));
+        auditQueue = job.catch(() => {});
+        const result = await job;
+        let dashboardNote = '';
+        if (chartSettings(interaction.guild.id).dashboard?.messageId) {
+          try { await updateChartDashboard(interaction.guild); }
+          catch (error) { console.error('Cannot update dashboard:', error); dashboardNote = '\n⚠️ Staff dashboard could not be updated.'; }
+        }
+        return interaction.editReply({ content: `✅ RP chart refreshed: **${result.members}** members with RP activity and **${result.messages}** messages found. ${result.warnings.length ? `⚠️ ${result.warnings.length} scan limitation(s); results may be incomplete.` : 'Scan completed.'}${dashboardNote}\nUse **/rpchart view** to inspect results.`, allowedMentions: { parse: [] } });
+      }
+      if (action === 'post') {
+        const message = await updateChartDashboard(interaction.guild);
+        return interaction.editReply({ content: `✅ Staff chart is available: ${message.url}\nIt updates after successful member RP checks. Run **/rpchart refresh** to rescan RP activity from everyone.`, allowedMentions: { parse: [] } });
+      }
+      const page = interaction.options.getInteger('page') || 1;
+      const result = await buildChartEmbed(interaction.guild, page);
+      return interaction.editReply({ embeds: [result.embed], allowedMentions: { parse: [] } });
     }
 
     if (name === 'rplog') {
@@ -596,7 +855,8 @@ client.on(Events.InteractionCreate, async interaction => {
       const embed = new EmbedBuilder().setColor(attached ? 0x3ba776 : 0xd6a140).setTitle('💾 Pip • Settings Health')
         .addFields(
           { name: 'Configuration path', value: `\`${truncate(CONFIG_PATH, 900)}\`` },
-          { name: 'Railway Volume', value: attached ? '✅ Attached' : '⚠️ Not detected', inline: true },
+          { name: 'Chart data path', value: `\`${truncate(CHART_PATH, 900)}\`` },
+          { name: 'Railway Volume', value: attached ? '✅ Attached' : '⚠️ Not detected — chart and settings may reset on redeploy', inline: true },
           { name: 'Sources configured', value: String(cfg.rpChannels.length), inline: true },
           { name: 'Audit window', value: `${cfg.hours} hours`, inline: true },
         );
@@ -654,103 +914,18 @@ client.on(Events.InteractionCreate, async interaction => {
   }
 });
 
+// The ONLY supported prefix command is !rpcheck. Everything else uses `/`.
 client.on(Events.MessageCreate, async message => {
-  if (!message.guild || message.author.bot || !message.content.startsWith('!')) return;
-  const [commandRaw, ...args] = message.content.trim().split(/\s+/);
-  const command = commandRaw.toLowerCase();
-  const cfg = settings(message.guild.id);
-
+  if (!message.guild || message.author.bot || message.content.trim().toLowerCase() !== '!rpcheck') return;
   try {
-    if (command === '!rpcheck') {
-      if (args.length) return; // Only !rpcheck, not !rpcheck @someone
-      if (cfg.checkChannel && message.channel.id !== cfg.checkChannel) {
-        return reply(message, `Use <#${cfg.checkChannel}> to submit your RP check.`);
-      }
-      enqueueAudit(message, message.author);
-      return;
+    const cfg = settings(message.guild.id);
+    if (cfg.checkChannel && message.channelId !== cfg.checkChannel) {
+      return reply(message, `Use <#${cfg.checkChannel}> to submit your RP check.`);
     }
-
-    if (command === '!cmd' || command === '!help') {
-      return message.reply({ embeds: [helpEmbed('list')], allowedMentions: { repliedUser: false, parse: [] } });
-    }
-
-    // The commands below are restricted to staff; configure STAFF_ROLE_IDS
-    // or grant staff Manage Server permission in Discord.
-    if (!['!rpadd', '!rpremove', '!rplist', '!rplogchannel', '!rpcheckchannel', '!rphours', '!rplog', '!rphealth'].includes(command)) return;
-    if (!isStaff(message)) return reply(message, 'This is a staff-only command.');
-
-    if (command === '!rplist') {
-      return reply(message,
-        `**Monitored RP channels / forums / threads:**\n${cfg.rpChannels.map(id => `• <#${id}>`).join('\n') || '(none)'}\n` +
-        `Staff log: ${cfg.logChannel ? `<#${cfg.logChannel}>` : '(not set)'}\n` +
-        `Check channel: ${cfg.checkChannel ? `<#${cfg.checkChannel}>` : '(any channel until set)'}\n` +
-        `Audit window: ${cfg.hours} hours.`
-      );
-    }
-
-    if (command === '!rphealth') {
-      return reply(message, `**Pip settings storage**\nPath: \`${CONFIG_PATH}\`\nRailway volume attached: **${Boolean(process.env.RAILWAY_VOLUME_MOUNT_PATH) ? 'yes' : 'no'}**\nConfigured RP sources: ${cfg.rpChannels.length}`);
-    }
-
-    if (command === '!rplog') {
-      const id = args[0]?.match(/^<@!?(\d+)>$|^(\d+)$/)?.slice(1).find(Boolean);
-      if (!id) return reply(message, 'Usage: `!rplog @member` or `!rplog USER_ID`');
-      const user = await client.users.fetch(id).catch(() => null);
-      if (!user) return reply(message, 'Could not find that Discord user.');
-      enqueueAudit(message, user);
-      return;
-    }
-
-    // Changing configuration requires Manage Server permission.
-    if (!isManager(message)) return reply(message, 'You need **Manage Server** to change RP bot settings.');
-
-    if (command === '!rphours') {
-      const hours = Number(args[0]);
-      if (!Number.isInteger(hours) || hours < 1 || hours > 336) {
-        return reply(message, 'Usage: `!rphours 48` (between 1 and 336 hours).');
-      }
-      cfg.hours = hours;
-      saveSettings();
-      return reply(message, `RP audit window set to ${hours} hours.`);
-    }
-
-    const channel = await parseChannel(message, args[0]);
-    const supportsThisCommand = (command === '!rpadd' || command === '!rpremove')
-      ? isSupportedMonitorChannel(channel)
-      : isSupportedChannel(channel);
-    if (!supportsThisCommand) {
-      return reply(message, `Usage: \`${command} #channel\` (monitoring accepts text, forum, or specific thread IDs; check and log channels must be text channels).`);
-    }
-
-    if (command === '!rpadd') {
-      if (channel.id === cfg.logChannel) return reply(message, 'The staff log channel cannot be monitored as an RP channel.');
-      if (cfg.rpChannels.includes(channel.id)) return reply(message, 'That RP channel is already monitored.');
-      cfg.rpChannels.push(channel.id);
-      saveSettings();
-      return reply(message, `Added <#${channel.id}> to RP monitoring.`);
-    }
-
-    if (command === '!rpremove') {
-      cfg.rpChannels = cfg.rpChannels.filter(id => id !== channel.id);
-      saveSettings();
-      return reply(message, `Removed <#${channel.id}> from RP monitoring.`);
-    }
-
-    if (command === '!rplogchannel') {
-      if (cfg.rpChannels.includes(channel.id)) return reply(message, 'Choose a staff log channel outside the monitored RP channels.');
-      cfg.logChannel = channel.id;
-      saveSettings();
-      return reply(message, `Staff audit logs will be posted to <#${channel.id}>.`);
-    }
-
-    if (command === '!rpcheckchannel') {
-      cfg.checkChannel = channel.id;
-      saveSettings();
-      return reply(message, `Members may now submit \`!rpcheck\` in <#${channel.id}>.`);
-    }
+    enqueueAudit(message, message.author);
   } catch (error) {
-    console.error('Command error:', error);
-    await reply(message, 'An error occurred. Check the bot console and permissions.').catch(() => {});
+    console.error('!rpcheck failed:', error);
+    await reply(message, 'Pip could not process the RP check.').catch(() => {});
   }
 });
 
