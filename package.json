@@ -1,8 +1,8 @@
 {
   "name": "pip-rpcheck-bot",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "private": true,
-  "description": "Pip RP check bot \u2014 only !rpcheck prefix, slash commands, roleplay activity chart, forum/thread scanning, persistent Railway volume",
+  "description": "Pip RP activity tracker \u2014 Tupperbox ownership log attribution, optional staff webhook mirroring, slash commands and !rpcheck, forum/thread scanning, Railway volume",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
