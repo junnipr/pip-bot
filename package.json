@@ -1,8 +1,8 @@
 {
   "name": "pip-rpcheck-bot",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "private": true,
-  "description": "Pip RP audit bot with slash commands, /cmd interactive embed menu, forum/thread scans, and Railway Volume configuration",
+  "description": "Pip RP check bot \u2014 only !rpcheck prefix, slash commands, roleplay activity chart, forum/thread scanning, persistent Railway volume",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
